@@ -38,16 +38,6 @@ Currently `meow journal` is read-only. Could add entry creation.
 - Language templates layer on top
 - Keep defaults minimal - don't over-engineer
 
-## Sparse Checkout Optimization
-
-Current implementation rewrites sparse-checkout file on every add/rm.
-**Possible improvements:**
-- Batch operations: `meow add foo bar baz`
-- Check if project already focused before modifying
-- Partial clone for very large repos
-**Performance target:**
-- Sub-100ms for typical operations (already achieved)
-
 ## Non-Goals
 
 Explicitly out of scope to keep meow focused:
