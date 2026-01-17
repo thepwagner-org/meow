@@ -371,6 +371,14 @@ fn validate_field_type(
                 });
             }
         }
+        FieldType::Bool => {
+            if !value.is_bool() && !value.is_null() {
+                errors.push(ValidationError {
+                    line: 0,
+                    message: format!("field '{}' must be a boolean", field_name),
+                });
+            }
+        }
         FieldType::Enum => {
             if let Some(valid_values) = &field_def.values {
                 if let Some(s) = value.as_str() {

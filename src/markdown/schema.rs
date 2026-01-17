@@ -102,6 +102,8 @@ pub enum FieldType {
     Datetime,
     /// Whole number.
     Integer,
+    /// Boolean true/false.
+    Bool,
     /// One of a fixed set of values.
     Enum,
     /// URL or relative file path.
