@@ -449,7 +449,7 @@ pub fn validate_link_exists(link: &str, ctx: &FormatContext) -> Option<Validatio
 }
 
 /// Normalize a path by resolving . and .. components.
-fn normalize_path(path: &Path) -> std::path::PathBuf {
+pub fn normalize_path(path: &Path) -> std::path::PathBuf {
     let mut result = std::path::PathBuf::new();
     for component in path.components() {
         match component {
@@ -464,7 +464,7 @@ fn normalize_path(path: &Path) -> std::path::PathBuf {
 }
 
 /// Simple URL decoding for file paths.
-fn urlencoding_decode(s: &str) -> String {
+pub fn urlencoding_decode(s: &str) -> String {
     let mut result = String::new();
     let mut chars = s.chars().peekable();
 

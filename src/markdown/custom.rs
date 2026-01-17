@@ -2,11 +2,23 @@
 //!
 //! This module handles documents that are validated against `.meow.d/` definitions.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
 use super::{
-    schema::{FieldType, Schema, TypeDef},
-    validate_bullets_only, validate_link_exists, Block, Document, FormatContext, ValidationError,
+    normalize_path,
+    schema::{FieldType, LinksDef, Schema, TypeDef},
+    urlencoding_decode, validate_bullets_only, validate_link_exists, Block, Document,
+    FormatContext, Inline, ValidationError,
 };
 use chrono::NaiveDate;
+
+// Cache for parsed document frontmatter types.
+// Key is absolute path, value is the document's type field.
+thread_local! {
+    static TYPE_CACHE: RefCell<HashMap<PathBuf, Option<String>>> = RefCell::new(HashMap::new());
+}
 
 /// Validate a document against its schema type definition.
 pub fn validate(
@@ -53,7 +65,7 @@ pub fn validate(
 
     validate_fields(fm, type_def, &mut errors);
     validate_frontmatter_links(fm, type_def, ctx, &mut errors);
-    validate_structure(doc, ctx, type_def, &mut errors);
+    validate_structure(doc, ctx, schema, type_name, type_def, &mut errors);
     errors
 }
 
@@ -61,6 +73,8 @@ pub fn validate(
 fn validate_structure(
     doc: &Document,
     ctx: &FormatContext,
+    schema: &Schema,
+    source_type: &str,
     type_def: &TypeDef,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -154,7 +168,7 @@ fn validate_structure(
         }
 
         // Validate section content format (bullets by default)
-        validate_section_content(doc, structure, errors);
+        validate_section_content(doc, structure, schema, source_type, ctx, errors);
     }
 }
 
@@ -194,6 +208,9 @@ fn validate_intro_content(
 fn validate_section_content(
     doc: &Document,
     structure: &super::schema::StructureDef,
+    schema: &Schema,
+    source_type: &str,
+    ctx: &FormatContext,
     errors: &mut Vec<ValidationError>,
 ) {
     use super::schema::{matches_template, parse_template};
@@ -260,6 +277,325 @@ fn validate_section_content(
                     }
                 }
             }
+        }
+
+        // Validate section link constraints
+        if let Some(ref links_def) = section_def.links {
+            validate_section_links(
+                doc,
+                section_title,
+                links_def,
+                schema,
+                source_type,
+                ctx,
+                errors,
+            );
+        }
+    }
+}
+
+/// Validate link constraints for a section.
+fn validate_section_links(
+    doc: &Document,
+    section_title: &str,
+    links_def: &LinksDef,
+    schema: &Schema,
+    source_type: &str,
+    ctx: &FormatContext,
+    errors: &mut Vec<ValidationError>,
+) {
+    // Extract links from this section
+    let links = extract_section_links(doc, section_title);
+
+    if links.is_empty() {
+        return;
+    }
+
+    // Validate each link
+    for link_url in &links {
+        // Skip external URLs
+        if link_url.starts_with("http://") || link_url.starts_with("https://") {
+            continue;
+        }
+
+        // Resolve link to absolute path
+        let Some(target_path) = resolve_link_path(link_url, ctx) else {
+            continue; // Path resolution failed, already reported by validate_link_exists
+        };
+
+        // Get target's type
+        let target_type = get_cached_type(&target_path);
+
+        // Validate target_type constraint
+        if let Some(ref expected_type) = links_def.target_type {
+            match &target_type {
+                Some(actual_type) if actual_type != expected_type => {
+                    errors.push(ValidationError {
+                        line: 0,
+                        message: format!(
+                            "section '{}': link to '{}' must be type '{}', got '{}'",
+                            section_title, link_url, expected_type, actual_type
+                        ),
+                    });
+                    continue;
+                }
+                None => {
+                    errors.push(ValidationError {
+                        line: 0,
+                        message: format!(
+                            "section '{}': link target '{}' has no type field",
+                            section_title, link_url
+                        ),
+                    });
+                    continue;
+                }
+                _ => {} // Type matches
+            }
+        }
+
+        // Validate bidirectional link
+        if links_def.bidirectional {
+            if let Some(ref target_type_name) = target_type {
+                let result = validate_bidirectional_link(
+                    &target_path,
+                    target_type_name,
+                    source_type,
+                    ctx.path,
+                    schema,
+                );
+
+                match result {
+                    BidirectionalResult::Ok => {}
+                    BidirectionalResult::TargetTypeNotInSchema => {
+                        errors.push(ValidationError {
+                            line: 0,
+                            message: format!(
+                                "section '{}': bidirectional link to '{}' - target type '{}' not in schema",
+                                section_title, link_url, target_type_name
+                            ),
+                        });
+                    }
+                    BidirectionalResult::NoInverseSection => {
+                        errors.push(ValidationError {
+                            line: 0,
+                            message: format!(
+                                "section '{}': bidirectional link to '{}' - target type '{}' has no section linking to '{}'",
+                                section_title, link_url, target_type_name, source_type
+                            ),
+                        });
+                    }
+                    BidirectionalResult::MissingBacklink { inverse_section } => {
+                        let source_filename = ctx
+                            .path
+                            .file_name()
+                            .map(|s| s.to_string_lossy())
+                            .unwrap_or_default();
+                        let target_filename = target_path
+                            .file_name()
+                            .map(|s| s.to_string_lossy())
+                            .unwrap_or_default();
+
+                        errors.push(ValidationError {
+                            line: 0,
+                            message: format!(
+                                "section '{}': bidirectional link - '{}' links to '{}' but '{}' section '{}' doesn't link back",
+                                section_title,
+                                source_filename,
+                                target_filename,
+                                target_filename,
+                                inverse_section
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Extract all link URLs from a section's bullet points.
+fn extract_section_links(doc: &Document, section_title: &str) -> Vec<String> {
+    let mut links = Vec::new();
+
+    // Find the section's H2 position
+    let h2_positions: Vec<(usize, String)> = doc
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| match b {
+            Block::Heading { level: 2, content } => Some((i, super::inlines_to_string(content))),
+            _ => None,
+        })
+        .collect();
+
+    // Find our section
+    let section_idx = h2_positions
+        .iter()
+        .position(|(_, title)| title == section_title);
+
+    let Some(idx) = section_idx else {
+        return links;
+    };
+
+    let start_pos = h2_positions[idx].0;
+    let end_pos = h2_positions
+        .get(idx + 1)
+        .map(|(pos, _)| *pos)
+        .unwrap_or(doc.blocks.len());
+
+    // Extract links from blocks in this section
+    for block in &doc.blocks[start_pos + 1..end_pos] {
+        extract_links_from_block(block, &mut links);
+    }
+
+    links
+}
+
+/// Recursively extract link URLs from a block.
+fn extract_links_from_block(block: &Block, links: &mut Vec<String>) {
+    match block {
+        Block::List { items, .. } => {
+            for item in items {
+                extract_links_from_inlines(&item.content, links);
+                for child in &item.children {
+                    extract_links_from_block(child, links);
+                }
+            }
+        }
+        Block::Paragraph(content) => {
+            extract_links_from_inlines(content, links);
+        }
+        _ => {}
+    }
+}
+
+/// Extract link URLs from inline elements.
+fn extract_links_from_inlines(inlines: &[Inline], links: &mut Vec<String>) {
+    for inline in inlines {
+        match inline {
+            Inline::Link { url, .. } => {
+                links.push(url.clone());
+            }
+            Inline::Strong(inner) | Inline::Emphasis(inner) => {
+                extract_links_from_inlines(inner, links);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Resolve a relative link to an absolute path.
+fn resolve_link_path(link: &str, ctx: &FormatContext) -> Option<PathBuf> {
+    // Skip external URLs
+    if link.starts_with("http://") || link.starts_with("https://") {
+        return None;
+    }
+
+    // Skip anchor-only links
+    if link.starts_with('#') {
+        return None;
+    }
+
+    // URL-decode the path
+    let decoded = urlencoding_decode(link);
+    let link_path = Path::new(&decoded);
+
+    // Resolve relative path against the file's directory
+    let base_dir = ctx.path.parent()?;
+    let resolved = base_dir.join(link_path);
+
+    // Normalize the path (resolve .. and .)
+    Some(normalize_path(&resolved))
+}
+
+/// Get a file's frontmatter type, using cache.
+fn get_cached_type(path: &Path) -> Option<String> {
+    TYPE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+
+        if let Some(cached) = cache.get(path) {
+            return cached.clone();
+        }
+
+        // Read and parse the file
+        let doc_type = read_frontmatter_type(path);
+        let _ = cache.insert(path.to_path_buf(), doc_type.clone());
+        doc_type
+    })
+}
+
+/// Read just the frontmatter type field from a file.
+fn read_frontmatter_type(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let doc = super::parse(&content);
+    doc.frontmatter?.doc_type
+}
+
+/// Result of bidirectional link validation.
+enum BidirectionalResult {
+    /// Link is valid (backlink exists).
+    Ok,
+    /// Target type not found in schema.
+    TargetTypeNotInSchema,
+    /// Target type has no section linking back to source type.
+    NoInverseSection,
+    /// Backlink is missing.
+    MissingBacklink { inverse_section: String },
+}
+
+/// Validate that a bidirectional link exists from target back to source.
+#[allow(clippy::too_many_arguments)]
+fn validate_bidirectional_link(
+    target_path: &Path,
+    target_type: &str,
+    source_type: &str,
+    source_path: &Path,
+    schema: &Schema,
+) -> BidirectionalResult {
+    // Find the inverse section in the target type's schema
+    let Some(target_type_def) = schema.get_type(target_type) else {
+        return BidirectionalResult::TargetTypeNotInSchema;
+    };
+
+    // Find a section in target schema that links back to source_type
+    let inverse_section = target_type_def.structure.sections.iter().find(|s| {
+        s.links
+            .as_ref()
+            .and_then(|l| l.target_type.as_ref())
+            .map(|t| t == source_type)
+            .unwrap_or(false)
+    });
+
+    let Some(inverse_section) = inverse_section else {
+        return BidirectionalResult::NoInverseSection;
+    };
+
+    // Parse target document and check for backlink
+    let Ok(target_content) = std::fs::read_to_string(target_path) else {
+        return BidirectionalResult::Ok; // Can't read target, assume ok
+    };
+
+    let target_doc = super::parse(&target_content);
+    let target_links = extract_section_links(&target_doc, &inverse_section.title);
+
+    // Check if any link in target points back to source
+    let has_backlink = target_links.iter().any(|target_link| {
+        // Resolve the target's link relative to target file
+        let target_dir = target_path.parent();
+        if let Some(target_dir) = target_dir {
+            let decoded = urlencoding_decode(target_link);
+            let resolved = normalize_path(&target_dir.join(Path::new(&decoded)));
+            resolved == source_path
+        } else {
+            false
+        }
+    });
+
+    if has_backlink {
+        BidirectionalResult::Ok
+    } else {
+        BidirectionalResult::MissingBacklink {
+            inverse_section: inverse_section.title.clone(),
         }
     }
 }
@@ -860,5 +1196,308 @@ date: March 15, 2024
         let fm = doc.frontmatter.as_ref().expect("should have frontmatter");
         let date_val = fm.extra.get("date").expect("should have date");
         assert_eq!(date_val.as_str(), Some("2024-03-15"));
+    }
+
+    #[test]
+    fn test_validate_section_link_target_type() {
+        use std::io::Write;
+
+        // Create temp directory with test files
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let threats_dir = dir.path().join("threats");
+        let mitigations_dir = dir.path().join("mitigations");
+        std::fs::create_dir_all(&threats_dir).expect("create threats dir");
+        std::fs::create_dir_all(&mitigations_dir).expect("create mitigations dir");
+
+        // Create a mitigation file
+        let mitigation_path = mitigations_dir.join("Firewall.md");
+        let mut f = std::fs::File::create(&mitigation_path).expect("create mitigation");
+        writeln!(f, "---\ntype: mitigation\n---\n# Firewall").expect("write mitigation");
+
+        // Create a wrong-type file (a threat, not mitigation)
+        let wrong_type_path = mitigations_dir.join("Wrong.md");
+        let mut f = std::fs::File::create(&wrong_type_path).expect("create wrong type");
+        writeln!(f, "---\ntype: threat\n---\n# Wrong").expect("write wrong type");
+
+        // Build schema with both types
+        let mut schema = Schema::default();
+        let threat_def: TypeDef = serde_yaml::from_str(
+            r#"
+structure:
+  sections:
+    - title: Mitigated By
+      links:
+        target_type: mitigation
+"#,
+        )
+        .expect("parse threat type");
+        let mitigation_def: TypeDef = serde_yaml::from_str(
+            r#"
+structure:
+  sections:
+    - title: Counters
+"#,
+        )
+        .expect("parse mitigation type");
+        let _ = schema.types.insert("threat".to_string(), threat_def);
+        let _ = schema
+            .types
+            .insert("mitigation".to_string(), mitigation_def);
+
+        // Test: link to correct type passes
+        let threat_path = threats_dir.join("SQL Injection.md");
+        let doc = parse(
+            r#"---
+type: threat
+---
+# SQL Injection
+
+## Mitigated By
+
+- [Firewall](../mitigations/Firewall.md)
+"#,
+        );
+
+        let ctx = FormatContext {
+            project: "test",
+            path: &threat_path,
+            year_month: None,
+            git_tree: None,
+            repo_root: None,
+        };
+
+        let errors = validate(&doc, &ctx, &schema, "threat");
+        assert!(
+            errors.is_empty(),
+            "expected no errors for correct type, got: {:?}",
+            errors
+        );
+
+        // Test: link to wrong type errors
+        let doc = parse(
+            r#"---
+type: threat
+---
+# SQL Injection
+
+## Mitigated By
+
+- [Wrong](../mitigations/Wrong.md)
+"#,
+        );
+
+        let errors = validate(&doc, &ctx, &schema, "threat");
+        assert_eq!(errors.len(), 1, "expected 1 error, got: {:?}", errors);
+        assert!(
+            errors[0].message.contains("must be type 'mitigation'"),
+            "expected type mismatch error, got: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn test_validate_section_link_bidirectional() {
+        use std::io::Write;
+
+        // Create temp directory with test files
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let threats_dir = dir.path().join("threats");
+        let mitigations_dir = dir.path().join("mitigations");
+        std::fs::create_dir_all(&threats_dir).expect("create threats dir");
+        std::fs::create_dir_all(&mitigations_dir).expect("create mitigations dir");
+
+        // Create threat file
+        let threat_path = threats_dir.join("SQL Injection.md");
+        let mut f = std::fs::File::create(&threat_path).expect("create threat");
+        writeln!(
+            f,
+            r#"---
+type: threat
+---
+# SQL Injection
+
+## Mitigated By
+
+- [Firewall](../mitigations/Firewall.md)
+"#
+        )
+        .expect("write threat");
+
+        // Create mitigation WITH backlink
+        let mitigation_with_backlink = mitigations_dir.join("Firewall.md");
+        let mut f = std::fs::File::create(&mitigation_with_backlink).expect("create mitigation");
+        writeln!(
+            f,
+            r#"---
+type: mitigation
+---
+# Firewall
+
+## Counters
+
+- [SQL Injection](../threats/SQL%20Injection.md)
+"#
+        )
+        .expect("write mitigation");
+
+        // Create mitigation WITHOUT backlink
+        let mitigation_no_backlink = mitigations_dir.join("NoBacklink.md");
+        let mut f =
+            std::fs::File::create(&mitigation_no_backlink).expect("create mitigation no backlink");
+        writeln!(
+            f,
+            r#"---
+type: mitigation
+---
+# NoBacklink
+
+## Counters
+
+- [Other Threat](../threats/Other.md)
+"#
+        )
+        .expect("write mitigation no backlink");
+
+        // Build schema with bidirectional links
+        let mut schema = Schema::default();
+        let threat_def: TypeDef = serde_yaml::from_str(
+            r#"
+structure:
+  sections:
+    - title: Mitigated By
+      links:
+        target_type: mitigation
+        bidirectional: true
+"#,
+        )
+        .expect("parse threat type");
+        let mitigation_def: TypeDef = serde_yaml::from_str(
+            r#"
+structure:
+  sections:
+    - title: Counters
+      links:
+        target_type: threat
+"#,
+        )
+        .expect("parse mitigation type");
+        let _ = schema.types.insert("threat".to_string(), threat_def);
+        let _ = schema
+            .types
+            .insert("mitigation".to_string(), mitigation_def);
+
+        // Test: bidirectional link with backlink passes
+        let doc = parse(
+            r#"---
+type: threat
+---
+# SQL Injection
+
+## Mitigated By
+
+- [Firewall](../mitigations/Firewall.md)
+"#,
+        );
+
+        let ctx = FormatContext {
+            project: "test",
+            path: &threat_path,
+            year_month: None,
+            git_tree: None,
+            repo_root: None,
+        };
+
+        let errors = validate(&doc, &ctx, &schema, "threat");
+        assert!(
+            errors.is_empty(),
+            "expected no errors when backlink exists, got: {:?}",
+            errors
+        );
+
+        // Test: bidirectional link without backlink errors
+        let doc = parse(
+            r#"---
+type: threat
+---
+# SQL Injection
+
+## Mitigated By
+
+- [NoBacklink](../mitigations/NoBacklink.md)
+"#,
+        );
+
+        let errors = validate(&doc, &ctx, &schema, "threat");
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected 1 error for missing backlink, got: {:?}",
+            errors
+        );
+        assert!(
+            errors[0].message.contains("doesn't link back"),
+            "expected backlink error, got: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn test_validate_section_link_no_type_field() {
+        use std::io::Write;
+
+        // Create temp directory with test files
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let threats_dir = dir.path().join("threats");
+        let mitigations_dir = dir.path().join("mitigations");
+        std::fs::create_dir_all(&threats_dir).expect("create threats dir");
+        std::fs::create_dir_all(&mitigations_dir).expect("create mitigations dir");
+
+        // Create a file with no type field
+        let no_type_path = mitigations_dir.join("NoType.md");
+        let mut f = std::fs::File::create(&no_type_path).expect("create no type file");
+        writeln!(f, "---\nname: NoType\n---\n# NoType").expect("write no type");
+
+        // Build schema
+        let mut schema = Schema::default();
+        let threat_def: TypeDef = serde_yaml::from_str(
+            r#"
+structure:
+  sections:
+    - title: Mitigated By
+      links:
+        target_type: mitigation
+"#,
+        )
+        .expect("parse threat type");
+        let _ = schema.types.insert("threat".to_string(), threat_def);
+
+        let threat_path = threats_dir.join("Test.md");
+        let doc = parse(
+            r#"---
+type: threat
+---
+# Test
+
+## Mitigated By
+
+- [NoType](../mitigations/NoType.md)
+"#,
+        );
+
+        let ctx = FormatContext {
+            project: "test",
+            path: &threat_path,
+            year_month: None,
+            git_tree: None,
+            repo_root: None,
+        };
+
+        let errors = validate(&doc, &ctx, &schema, "threat");
+        assert_eq!(errors.len(), 1, "expected 1 error, got: {:?}", errors);
+        assert!(
+            errors[0].message.contains("has no type field"),
+            "expected no type field error, got: {}",
+            errors[0].message
+        );
     }
 }

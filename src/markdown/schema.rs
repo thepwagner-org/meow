@@ -71,6 +71,19 @@ pub struct SectionDef {
     /// Template showing expected format (for LLM reference).
     #[serde(default)]
     pub template: Option<String>,
+    /// Link constraints for this section.
+    #[serde(default)]
+    pub links: Option<LinksDef>,
+}
+
+/// Link constraints for a section.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct LinksDef {
+    /// Target type name - links must point to files of this type.
+    pub target_type: Option<String>,
+    /// Whether links must be bidirectional (target links back).
+    #[serde(default)]
+    pub bidirectional: bool,
 }
 
 /// Definition of a frontmatter field.
