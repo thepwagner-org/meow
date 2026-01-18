@@ -101,6 +101,7 @@ pub fn mirror_path(org: &str, repo: &str) -> Result<PathBuf> {
 }
 
 /// Ensure a GitHub repo is cloned locally. Creates or fetches as needed.
+/// After fetching, resets to origin/main to ensure we can fast-forward push.
 pub fn ensure_clone(org: &str, repo: &str) -> Result<PathBuf> {
     let path = mirror_path(org, repo)?;
     let github_url = format!("git@github.com:{}/{}.git", org, repo);
@@ -117,6 +118,19 @@ pub fn ensure_clone(org: &str, repo: &str) -> Result<PathBuf> {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             tracing::warn!("git fetch warning: {}", stderr.trim());
+        }
+
+        // Reset to origin/main to ensure our next commit is a fast-forward
+        tracing::debug!(path = %path.display(), "resetting to origin/main");
+        let output = Command::new("git")
+            .args(["reset", "--hard", "origin/main"])
+            .current_dir(&path)
+            .output()
+            .context("failed to run git reset")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::warn!("git reset warning: {}", stderr.trim());
         }
     } else {
         // Clone
