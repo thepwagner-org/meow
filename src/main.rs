@@ -84,5 +84,7 @@ fn run() -> Result<()> {
         Command::Decrypt { file, in_place } => commands::cmd_decrypt(&file, in_place),
 
         Command::Pull => commands::cmd_pull(&root),
+
+        Command::Mirror { command } => commands::cmd_mirror(&root, command),
     }
 }

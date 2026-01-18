@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, warn};
 
-use crate::cli::{FmtArgs, JournalArgs, PruneArgs};
+use crate::cli::{FmtArgs, JournalArgs, MirrorCommand, PruneArgs};
 use crate::markdown::{
     self, claude, is_encrypted, parse, parse_encrypted, readme, serialize, FormatContext,
 };
-use crate::{git, picker, sparse, PROJECTS_DIR};
+use crate::{git, mirror, picker, sparse, PROJECTS_DIR};
 
 pub fn validate_project_name(name: &str) -> Result<()> {
     if name.is_empty() {
@@ -220,7 +220,7 @@ pub fn cmd_init(shell: &str) -> Result<String> {
         r#"function meow
   set -l __meow_bin "{bin}"
   switch $argv[1]
-    case list ls rm drop init fmt journal zellij z prune decrypt pull --help -h --version -V
+    case list ls rm drop init fmt journal zellij z prune decrypt pull mirror --help -h --version -V
       $__meow_bin $argv
     case add cd
       set -l result ($__meow_bin $argv)
@@ -819,6 +819,94 @@ pub fn cmd_decrypt(file: &Path, in_place: bool) -> Result<()> {
             print!("{}", decrypted);
         }
     }
+
+    Ok(())
+}
+
+pub fn cmd_mirror(root: &Path, command: MirrorCommand) -> Result<()> {
+    match command {
+        MirrorCommand::Status => cmd_mirror_status(root),
+        MirrorCommand::Diff { project } => cmd_mirror_diff(root, project),
+    }
+}
+
+fn cmd_mirror_status(root: &Path) -> Result<()> {
+    let statuses = mirror::get_all_status(root)?;
+
+    if statuses.is_empty() {
+        info!(
+            "No projects configured for mirroring (add 'github: org/repo' to README frontmatter)"
+        );
+        return Ok(());
+    }
+
+    #[allow(clippy::print_stdout)]
+    {
+        for status in &statuses {
+            let state = if !status.mirror_exists {
+                "not cloned"
+            } else if status.has_changes {
+                "uncommitted changes"
+            } else if status.has_unpushed {
+                "unpushed commits"
+            } else {
+                "clean"
+            };
+
+            println!(
+                "{}: {}/{} ({})",
+                status.project, status.config.org, status.config.repo, state
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_mirror_diff(root: &Path, project: Option<String>) -> Result<()> {
+    // Resolve project name
+    let project = match project {
+        Some(p) => p,
+        None => git::detect_project_from_cwd(root)?
+            .context("Not in a project directory. Specify project name.")?,
+    };
+
+    // Load project README and extract mirror config
+    let readme_path = root.join(PROJECTS_DIR).join(&project).join("README.md");
+    if !readme_path.exists() {
+        bail!("Project '{}' has no README.md", project);
+    }
+
+    let content = fs::read_to_string(&readme_path)?;
+    let doc = parse(&content);
+    let config = doc
+        .frontmatter
+        .as_ref()
+        .and_then(mirror::MirrorConfig::from_frontmatter)
+        .with_context(|| {
+            format!(
+                "Project '{}' has no github field in README frontmatter",
+                project
+            )
+        })?;
+
+    // Ensure clone exists
+    let mirror_path = mirror::ensure_clone(&config.org, &config.repo)?;
+
+    // Sync filtered content to mirror
+    let source_path = root.join(PROJECTS_DIR).join(&project);
+    let file_count = mirror::sync_to_mirror(&source_path, &mirror_path, &config)?;
+
+    #[allow(clippy::print_stdout)]
+    {
+        println!("{}", mirror_path.display());
+    }
+
+    info!(
+        "Synced {} files to mirror (excludes: {:?})",
+        file_count,
+        mirror::HARDCODED_EXCLUDES
+    );
 
     Ok(())
 }

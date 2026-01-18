@@ -97,6 +97,24 @@ pub enum Command {
 
     /// Pull latest changes in the monorepo
     Pull,
+
+    /// GitHub mirror management
+    Mirror {
+        #[command(subcommand)]
+        command: MirrorCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MirrorCommand {
+    /// Show status of all mirrored projects
+    Status,
+
+    /// Prepare mirror for a project (clone, sync, show path)
+    Diff {
+        /// Project name (defaults to current directory's project)
+        project: Option<String>,
+    },
 }
 
 #[derive(Args, Debug)]

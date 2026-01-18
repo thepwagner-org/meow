@@ -5,6 +5,7 @@ pub mod config;
 pub mod crypto;
 pub mod git;
 pub mod markdown;
+pub mod mirror;
 pub mod picker;
 pub mod sparse;
 
