@@ -134,6 +134,15 @@ fn format_file(
     let field_order: Option<Vec<&str>> = match &file_type {
         FileType::Custom { schema, type_name } => schema.get_type(type_name).map(|type_def| {
             let mut order: Vec<&str> = vec!["type"];
+            // Include structure.frontmatter fields (preserves schema order)
+            order.extend(
+                type_def
+                    .structure
+                    .frontmatter
+                    .iter()
+                    .map(|f| f.name.as_str()),
+            );
+            // Include typed fields
             order.extend(type_def.fields.keys().map(|s| s.as_str()));
             order
         }),

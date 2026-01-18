@@ -969,4 +969,64 @@ Some content here.
         let content = "# Just a heading\n\nSome content.\n";
         assert!(!is_encrypted(content));
     }
+
+    #[test]
+    fn test_serialize_with_field_order_preserves_extra_fields() {
+        let content = r#"---
+type: target
+category: account
+priority: high
+---
+
+# 1Password
+"#;
+        let doc = parse(content);
+
+        // Simulate what format.rs does: build field_order from structure.frontmatter
+        let field_order = vec!["type", "category", "priority"];
+        let serialized = serialize_with_field_order(&doc, Some(&field_order));
+
+        // The key assertion: category and priority should be preserved
+        assert!(
+            serialized.contains("category: account"),
+            "category field should be preserved, got:\n{}",
+            serialized
+        );
+        assert!(
+            serialized.contains("priority: high"),
+            "priority field should be preserved, got:\n{}",
+            serialized
+        );
+        assert!(
+            serialized.contains("type: target"),
+            "type field should be preserved, got:\n{}",
+            serialized
+        );
+    }
+
+    #[test]
+    fn test_serialize_with_field_order_respects_order() {
+        let content = r#"---
+type: target
+zebra: z
+alpha: a
+---
+
+# Test
+"#;
+        let doc = parse(content);
+
+        // Order should be: type, alpha, zebra (not alphabetical)
+        let field_order = vec!["type", "alpha", "zebra"];
+        let serialized = serialize_with_field_order(&doc, Some(&field_order));
+
+        // Check that alpha comes before zebra in the output
+        let alpha_pos = serialized.find("alpha:").expect("should have alpha");
+        let zebra_pos = serialized.find("zebra:").expect("should have zebra");
+        assert!(
+            alpha_pos < zebra_pos,
+            "alpha should come before zebra in output:\n{}",
+            serialized
+        );
+    }
 }

@@ -44,6 +44,9 @@ pub struct StructureDef {
     /// Title (H1) must match filename (without .md extension).
     #[serde(default)]
     pub title_from_filename: bool,
+    /// Frontmatter field definitions (order matters for serialization).
+    #[serde(default)]
+    pub frontmatter: Vec<FrontmatterFieldDef>,
     /// Intro section (content between H1 and first H2).
     #[serde(default)]
     pub intro: Option<SectionDef>,
@@ -84,6 +87,22 @@ pub struct LinksDef {
     /// Whether links must be bidirectional (target links back).
     #[serde(default)]
     pub bidirectional: bool,
+}
+
+/// Definition of a frontmatter field in structure.frontmatter.
+///
+/// This is a simpler format than `FieldDef`, used for declaring required
+/// frontmatter fields without type validation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FrontmatterFieldDef {
+    /// Field name.
+    pub name: String,
+    /// Description for documentation/LLM guidance.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Whether the field is required.
+    #[serde(default)]
+    pub required: bool,
 }
 
 /// Definition of a frontmatter field.
@@ -551,5 +570,68 @@ fields:
 "#;
         let type_def: TypeDef = serde_yaml::from_str(yaml).expect("should parse");
         assert!(type_def.index.is_none());
+    }
+
+    #[test]
+    fn test_parse_structure_frontmatter() {
+        let yaml = r#"
+description: "A target asset"
+structure:
+  title_from_filename: true
+  frontmatter:
+    - name: category
+      description: "account | device | physical"
+      required: true
+    - name: priority
+      required: false
+  sections:
+    - title: Notes
+      optional: true
+"#;
+        let type_def: TypeDef = serde_yaml::from_str(yaml).expect("should parse");
+
+        assert_eq!(type_def.structure.frontmatter.len(), 2);
+
+        let category = &type_def.structure.frontmatter[0];
+        assert_eq!(category.name, "category");
+        assert_eq!(
+            category.description.as_deref(),
+            Some("account | device | physical")
+        );
+        assert!(category.required);
+
+        let priority = &type_def.structure.frontmatter[1];
+        assert_eq!(priority.name, "priority");
+        assert!(priority.description.is_none());
+        assert!(!priority.required);
+    }
+
+    #[test]
+    fn test_structure_frontmatter_order_preserved() {
+        let yaml = r#"
+structure:
+  frontmatter:
+    - name: zebra
+    - name: alpha
+    - name: middle
+"#;
+        let type_def: TypeDef = serde_yaml::from_str(yaml).expect("should parse");
+
+        let names: Vec<&str> = type_def
+            .structure
+            .frontmatter
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["zebra", "alpha", "middle"]);
+    }
+
+    #[test]
+    fn test_structure_frontmatter_empty_by_default() {
+        let yaml = r#"
+description: "A simple type"
+"#;
+        let type_def: TypeDef = serde_yaml::from_str(yaml).expect("should parse");
+        assert!(type_def.structure.frontmatter.is_empty());
     }
 }

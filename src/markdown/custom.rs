@@ -602,6 +602,17 @@ fn validate_bidirectional_link(
 
 /// Validate frontmatter fields against type definition.
 fn validate_fields(fm: &super::Frontmatter, type_def: &TypeDef, errors: &mut Vec<ValidationError>) {
+    // Validate structure.frontmatter required fields
+    for field_def in &type_def.structure.frontmatter {
+        if field_def.required && !field_exists(fm, &field_def.name) {
+            errors.push(ValidationError {
+                line: 0,
+                message: format!("missing required field '{}'", field_def.name),
+            });
+        }
+    }
+
+    // Validate typed fields
     for (field_name, field_def) in &type_def.fields {
         // Check if field exists in frontmatter
         let exists = field_exists(fm, field_name);
@@ -1499,5 +1510,121 @@ type: threat
             "expected no type field error, got: {}",
             errors[0].message
         );
+    }
+
+    #[test]
+    fn test_validate_structure_frontmatter_required() {
+        let schema = make_schema(
+            "target",
+            r#"
+structure:
+  frontmatter:
+    - name: category
+      required: true
+    - name: priority
+      required: false
+"#,
+        );
+
+        // Missing required field
+        let doc = parse(
+            r#"---
+type: target
+priority: high
+---
+# Test Target
+"#,
+        );
+
+        let ctx = FormatContext {
+            project: "test",
+            path: std::path::Path::new("test.md"),
+            year_month: None,
+            git_tree: None,
+            repo_root: None,
+        };
+
+        let errors = validate(&doc, &ctx, &schema, "target");
+        assert_eq!(errors.len(), 1, "expected 1 error, got: {:?}", errors);
+        assert!(
+            errors[0]
+                .message
+                .contains("missing required field 'category'"),
+            "expected missing category error, got: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn test_validate_structure_frontmatter_valid() {
+        let schema = make_schema(
+            "target",
+            r#"
+structure:
+  frontmatter:
+    - name: category
+      required: true
+    - name: priority
+      required: false
+"#,
+        );
+
+        // Has required field
+        let doc = parse(
+            r#"---
+type: target
+category: account
+---
+# Test Target
+"#,
+        );
+
+        let ctx = FormatContext {
+            project: "test",
+            path: std::path::Path::new("test.md"),
+            year_month: None,
+            git_tree: None,
+            repo_root: None,
+        };
+
+        let errors = validate(&doc, &ctx, &schema, "target");
+        assert!(errors.is_empty(), "expected no errors, got: {:?}", errors);
+    }
+
+    #[test]
+    fn test_validate_structure_frontmatter_multiple_required() {
+        let schema = make_schema(
+            "threat",
+            r#"
+structure:
+  frontmatter:
+    - name: likelihood
+      required: true
+    - name: impact
+      required: true
+"#,
+        );
+
+        // Missing both required fields
+        let doc = parse(
+            r#"---
+type: threat
+---
+# Test Threat
+"#,
+        );
+
+        let ctx = FormatContext {
+            project: "test",
+            path: std::path::Path::new("test.md"),
+            year_month: None,
+            git_tree: None,
+            repo_root: None,
+        };
+
+        let errors = validate(&doc, &ctx, &schema, "threat");
+        assert_eq!(errors.len(), 2, "expected 2 errors, got: {:?}", errors);
+        assert!(errors.iter().any(|e| e.message.contains("'likelihood'")));
+        assert!(errors.iter().any(|e| e.message.contains("'impact'")));
     }
 }
