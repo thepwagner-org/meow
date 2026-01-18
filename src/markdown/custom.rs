@@ -557,46 +557,56 @@ fn validate_bidirectional_link(
         return BidirectionalResult::TargetTypeNotInSchema;
     };
 
-    // Find a section in target schema that links back to source_type
-    let inverse_section = target_type_def.structure.sections.iter().find(|s| {
-        s.links
-            .as_ref()
-            .and_then(|l| l.target_type.as_ref())
-            .map(|t| t == source_type)
-            .unwrap_or(false)
-    });
+    // Find ALL sections in target schema that link back to source_type
+    let inverse_sections: Vec<_> = target_type_def
+        .structure
+        .sections
+        .iter()
+        .filter(|s| {
+            s.links
+                .as_ref()
+                .and_then(|l| l.target_type.as_ref())
+                .map(|t| t == source_type)
+                .unwrap_or(false)
+        })
+        .collect();
 
-    let Some(inverse_section) = inverse_section else {
+    if inverse_sections.is_empty() {
         return BidirectionalResult::NoInverseSection;
-    };
+    }
 
-    // Parse target document and check for backlink
+    // Parse target document and check for backlink in ANY of the inverse sections
     let Ok(target_content) = std::fs::read_to_string(target_path) else {
         return BidirectionalResult::Ok; // Can't read target, assume ok
     };
 
     let target_doc = super::parse(&target_content);
-    let target_links = extract_section_links(&target_doc, &inverse_section.title);
 
-    // Check if any link in target points back to source
-    let has_backlink = target_links.iter().any(|target_link| {
-        // Resolve the target's link relative to target file
-        let target_dir = target_path.parent();
-        if let Some(target_dir) = target_dir {
-            let decoded = urlencoding_decode(target_link);
-            let resolved = normalize_path(&target_dir.join(Path::new(&decoded)));
-            resolved == source_path
-        } else {
-            false
-        }
-    });
+    // Check all inverse sections for a backlink
+    for inverse_section in &inverse_sections {
+        let target_links = extract_section_links(&target_doc, &inverse_section.title);
 
-    if has_backlink {
-        BidirectionalResult::Ok
-    } else {
-        BidirectionalResult::MissingBacklink {
-            inverse_section: inverse_section.title.clone(),
+        let has_backlink = target_links.iter().any(|target_link| {
+            // Resolve the target's link relative to target file
+            let target_dir = target_path.parent();
+            if let Some(target_dir) = target_dir {
+                let decoded = urlencoding_decode(target_link);
+                let resolved = normalize_path(&target_dir.join(Path::new(&decoded)));
+                resolved == source_path
+            } else {
+                false
+            }
+        });
+
+        if has_backlink {
+            return BidirectionalResult::Ok;
         }
+    }
+
+    // No backlink found in any inverse section
+    let section_names: Vec<_> = inverse_sections.iter().map(|s| s.title.as_str()).collect();
+    BidirectionalResult::MissingBacklink {
+        inverse_section: section_names.join("' or '"),
     }
 }
 
@@ -1626,5 +1636,185 @@ type: threat
         assert_eq!(errors.len(), 2, "expected 2 errors, got: {:?}", errors);
         assert!(errors.iter().any(|e| e.message.contains("'likelihood'")));
         assert!(errors.iter().any(|e| e.message.contains("'impact'")));
+    }
+
+    #[test]
+    fn test_validate_same_type_cross_section_bidirectional() {
+        use std::io::Write;
+
+        // Test case: threat -> threat with inverse sections "Leads To" <-> "Enabled By"
+        // This tests that bidirectional links work when the backlink is in a DIFFERENT
+        // section than the forward link (same document type, different sections).
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let threats_dir = dir.path().join("threats");
+        std::fs::create_dir_all(&threats_dir).expect("create threats dir");
+
+        // Create "Phishing" threat with "Leads To" linking to "Account Takeover"
+        let phishing_path = threats_dir.join("Phishing.md");
+        let mut f = std::fs::File::create(&phishing_path).expect("create phishing");
+        writeln!(
+            f,
+            r#"---
+type: threat
+---
+# Phishing
+
+## Leads To
+
+- [Account Takeover](Account%20Takeover.md)
+
+## Enabled By
+"#
+        )
+        .expect("write phishing");
+
+        // Create "Account Takeover" with "Enabled By" linking back to "Phishing"
+        let ato_path = threats_dir.join("Account Takeover.md");
+        let mut f = std::fs::File::create(&ato_path).expect("create ato");
+        writeln!(
+            f,
+            r#"---
+type: threat
+---
+# Account Takeover
+
+## Leads To
+
+## Enabled By
+
+- [Phishing](Phishing.md)
+"#
+        )
+        .expect("write ato");
+
+        // Build schema with both sections linking to threat type
+        let mut schema = Schema::default();
+        let threat_def: TypeDef = serde_yaml::from_str(
+            r#"
+structure:
+  sections:
+    - title: Leads To
+      links:
+        target_type: threat
+        bidirectional: true
+    - title: Enabled By
+      links:
+        target_type: threat
+        bidirectional: true
+"#,
+        )
+        .expect("parse threat type");
+        let _ = schema.types.insert("threat".to_string(), threat_def);
+
+        // Validate Phishing - should pass because Account Takeover links back in "Enabled By"
+        let doc = parse(
+            r#"---
+type: threat
+---
+# Phishing
+
+## Leads To
+
+- [Account Takeover](Account%20Takeover.md)
+
+## Enabled By
+"#,
+        );
+
+        let ctx = FormatContext {
+            project: "test",
+            path: &phishing_path,
+            year_month: None,
+            git_tree: None,
+            repo_root: None,
+        };
+
+        let errors = validate(&doc, &ctx, &schema, "threat");
+        assert!(
+            errors.is_empty(),
+            "expected no errors for cross-section backlink, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_validate_same_type_cross_section_missing_backlink() {
+        use std::io::Write;
+
+        // Same setup but Account Takeover does NOT link back to Phishing
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let threats_dir = dir.path().join("threats");
+        std::fs::create_dir_all(&threats_dir).expect("create threats dir");
+
+        // Create "Account Takeover" WITHOUT backlink to Phishing
+        let ato_path = threats_dir.join("Account Takeover.md");
+        let mut f = std::fs::File::create(&ato_path).expect("create ato");
+        writeln!(
+            f,
+            r#"---
+type: threat
+---
+# Account Takeover
+
+## Leads To
+
+## Enabled By
+"#
+        )
+        .expect("write ato");
+
+        let mut schema = Schema::default();
+        let threat_def: TypeDef = serde_yaml::from_str(
+            r#"
+structure:
+  sections:
+    - title: Leads To
+      links:
+        target_type: threat
+        bidirectional: true
+    - title: Enabled By
+      links:
+        target_type: threat
+        bidirectional: true
+"#,
+        )
+        .expect("parse threat type");
+        let _ = schema.types.insert("threat".to_string(), threat_def);
+
+        let phishing_path = threats_dir.join("Phishing.md");
+        let doc = parse(
+            r#"---
+type: threat
+---
+# Phishing
+
+## Leads To
+
+- [Account Takeover](Account%20Takeover.md)
+"#,
+        );
+
+        let ctx = FormatContext {
+            project: "test",
+            path: &phishing_path,
+            year_month: None,
+            git_tree: None,
+            repo_root: None,
+        };
+
+        let errors = validate(&doc, &ctx, &schema, "threat");
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected 1 error for missing cross-section backlink, got: {:?}",
+            errors
+        );
+        assert!(
+            errors[0].message.contains("doesn't link back"),
+            "expected backlink error, got: {}",
+            errors[0].message
+        );
     }
 }
