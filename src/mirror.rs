@@ -13,18 +13,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Hardcoded paths that are always excluded from mirrors.
-pub const HARDCODED_EXCLUDES: &[&str] = &[
-    "journal/",
-    ".meow.d/",
-    ".envrc",
-    ".claude/",
-    "CLAUDE.md",
-    // Build/dev artifacts
-    "target/",
-    ".direnv/",
-    "result",
-    ".github-mirror.toml",
-];
+/// These are git-tracked files that should remain private.
+/// Build artifacts (target/, node_modules/, etc.) are already excluded
+/// because we use `git ls-files` to enumerate source files.
+pub const HARDCODED_EXCLUDES: &[&str] = &["journal/", ".meow.d/", "CLAUDE.md", ".envrc"];
 
 /// MIT license text to inject into mirrored repositories.
 const MIT_LICENSE: &str = r#"MIT License
@@ -220,6 +212,29 @@ fn strip_frontmatter(content: &str) -> String {
     }
 }
 
+/// Get list of git-tracked files in a project directory.
+fn get_tracked_files(project_path: &Path) -> Result<Vec<PathBuf>> {
+    let output = Command::new("git")
+        .args(["ls-files", "--cached"])
+        .current_dir(project_path)
+        .output()
+        .context("Failed to run git ls-files")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "git ls-files failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let files = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(PathBuf::from)
+        .collect();
+
+    Ok(files)
+}
+
 /// Clean the mirror directory and copy filtered files from source project.
 pub fn sync_to_mirror(
     source_project: &Path,
@@ -231,15 +246,28 @@ pub fn sync_to_mirror(
     // Clean slate: remove all tracked files in mirror (keep .git)
     clean_mirror(mirror_path)?;
 
-    // Walk source project and copy files
+    // Get git-tracked files and copy those that aren't excluded
+    let tracked_files = get_tracked_files(source_project)?;
     let mut file_count = 0;
-    copy_filtered_tree(
-        source_project,
-        mirror_path,
-        Path::new(""),
-        &excludes,
-        &mut file_count,
-    )?;
+
+    for relative_path in tracked_files {
+        if should_exclude(&relative_path, &excludes) {
+            tracing::debug!(path = %relative_path.display(), "excluding from mirror");
+            continue;
+        }
+
+        let source_path = source_project.join(&relative_path);
+        let dest_path = mirror_path.join(&relative_path);
+
+        // Create parent directories as needed
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // Copy the file
+        let _ = fs::copy(&source_path, &dest_path)?;
+        file_count += 1;
+    }
 
     // Transform README.md (strip frontmatter)
     let readme_path = mirror_path.join("README.md");
@@ -274,52 +302,6 @@ fn clean_mirror(mirror_path: &Path) -> Result<()> {
             fs::remove_file(&path)?;
         }
     }
-    Ok(())
-}
-
-/// Recursively copy files from source to dest, applying exclude filters.
-fn copy_filtered_tree(
-    source_base: &Path,
-    dest_base: &Path,
-    relative: &Path,
-    excludes: &HashSet<String>,
-    file_count: &mut usize,
-) -> Result<()> {
-    let source_path = source_base.join(relative);
-
-    for entry in fs::read_dir(&source_path)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let entry_relative = relative.join(&name);
-
-        if should_exclude(&entry_relative, excludes) {
-            tracing::debug!(path = %entry_relative.display(), "excluding from mirror");
-            continue;
-        }
-
-        let file_type = entry.file_type()?;
-        let dest_path = dest_base.join(&entry_relative);
-
-        if file_type.is_dir() {
-            fs::create_dir_all(&dest_path)?;
-            copy_filtered_tree(
-                source_base,
-                dest_base,
-                &entry_relative,
-                excludes,
-                file_count,
-            )?;
-        } else if file_type.is_file() {
-            // Only copy regular files, skip symlinks
-            if let Some(parent) = dest_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let _ = fs::copy(entry.path(), &dest_path)?;
-            *file_count += 1;
-        }
-        // Skip symlinks silently
-    }
-
     Ok(())
 }
 
