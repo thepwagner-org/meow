@@ -325,6 +325,53 @@ pub fn has_unpushed_commits(mirror_path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Check if the project directory has uncommitted changes in the monorepo.
+pub fn is_project_dirty(root: &Path, project: &str) -> bool {
+    let project_path = root.join(PROJECTS_DIR).join(project);
+    Command::new("git")
+        .args(["status", "--porcelain", "--"])
+        .arg(&project_path)
+        .current_dir(root)
+        .output()
+        .map(|output| !output.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+/// Get the monorepo commit hash that was last synced to the mirror.
+/// Returns None if the tracking tag doesn't exist.
+pub fn get_synced_commit(mirror_path: &Path) -> Option<String> {
+    Command::new("git")
+        .args(["tag", "-l", "--format=%(contents)", "monorepo-synced"])
+        .current_dir(mirror_path)
+        .output()
+        .ok()
+        .and_then(|output| {
+            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        })
+}
+
+/// Get the latest monorepo commit that touched the project directory.
+pub fn get_latest_project_commit(root: &Path, project: &str) -> Result<String> {
+    let project_path = root.join(PROJECTS_DIR).join(project);
+    let output = Command::new("git")
+        .args(["log", "-1", "--format=%H", "--"])
+        .arg(&project_path)
+        .current_dir(root)
+        .output()
+        .context("Failed to run git log")?;
+
+    let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if hash.is_empty() {
+        bail!("No commits found for project '{}'", project);
+    }
+    Ok(hash)
+}
+
 /// Find all projects that have mirror configuration.
 pub fn find_mirrored_projects(root: &Path) -> Result<Vec<(String, MirrorConfig)>> {
     let projects_dir = root.join(PROJECTS_DIR);

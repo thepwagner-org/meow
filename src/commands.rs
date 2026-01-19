@@ -823,9 +823,13 @@ pub fn cmd_decrypt(file: &Path, in_place: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_mirror(root: &Path, command: MirrorCommand) -> Result<()> {
+/// Exit code indicating mirror is already synced (no work needed).
+pub const EXIT_ALREADY_SYNCED: u8 = 2;
+
+/// Result of mirror command - either success, already synced, or error.
+pub fn cmd_mirror(root: &Path, command: MirrorCommand) -> Result<Option<u8>> {
     match command {
-        MirrorCommand::Status => cmd_mirror_status(root),
+        MirrorCommand::Status => cmd_mirror_status(root).map(|()| None),
         MirrorCommand::Diff { project } => cmd_mirror_diff(root, project),
     }
 }
@@ -863,13 +867,21 @@ fn cmd_mirror_status(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_mirror_diff(root: &Path, project: Option<String>) -> Result<()> {
+fn cmd_mirror_diff(root: &Path, project: Option<String>) -> Result<Option<u8>> {
     // Resolve project name
     let project = match project {
         Some(p) => p,
         None => git::detect_project_from_cwd(root)?
             .context("Not in a project directory. Specify project name.")?,
     };
+
+    // HARD GATE: Check for uncommitted changes in project directory
+    if mirror::is_project_dirty(root, &project) {
+        bail!(
+            "Project '{}' has uncommitted changes. Commit or stash before mirroring.",
+            project
+        );
+    }
 
     // Load project README and extract mirror config
     let readme_path = root.join(PROJECTS_DIR).join(&project).join("README.md");
@@ -893,6 +905,22 @@ fn cmd_mirror_diff(root: &Path, project: Option<String>) -> Result<()> {
     // Ensure clone exists
     let mirror_path = mirror::ensure_clone(&config.org, &config.repo)?;
 
+    // Check if sync is needed
+    let latest_commit = mirror::get_latest_project_commit(root, &project)?;
+    if let Some(synced_commit) = mirror::get_synced_commit(&mirror_path) {
+        if synced_commit == latest_commit {
+            #[allow(clippy::print_stdout)]
+            {
+                println!("{}", mirror_path.display());
+            }
+            info!(
+                "Already synced at {}",
+                &latest_commit[..8.min(latest_commit.len())]
+            );
+            return Ok(Some(EXIT_ALREADY_SYNCED));
+        }
+    }
+
     // Sync filtered content to mirror
     let source_path = root.join(PROJECTS_DIR).join(&project);
     let file_count = mirror::sync_to_mirror(&source_path, &mirror_path, &config)?;
@@ -908,5 +936,5 @@ fn cmd_mirror_diff(root: &Path, project: Option<String>) -> Result<()> {
         mirror::HARDCODED_EXCLUDES
     );
 
-    Ok(())
+    Ok(None)
 }
