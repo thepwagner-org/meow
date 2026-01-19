@@ -92,6 +92,6 @@ fn run() -> Result<Option<u8>> {
 
         Command::Pull => commands::cmd_pull(&root).map(|()| None),
 
-        Command::Mirror { command } => commands::cmd_mirror(&root, command),
+        Command::Mirror { command } => commands::cmd_mirror(&root, command, use_color),
     }
 }

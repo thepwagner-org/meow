@@ -372,6 +372,21 @@ pub fn get_latest_project_commit(root: &Path, project: &str) -> Result<String> {
     Ok(hash)
 }
 
+/// Count commits between two commits that touched a project directory.
+/// Returns the number of commits in `from..to` range that modified the project.
+fn count_project_commits(root: &Path, project: &str, from: &str, to: &str) -> Option<usize> {
+    let project_path = root.join(PROJECTS_DIR).join(project);
+    let range = format!("{}..{}", from, to);
+    let output = Command::new("git")
+        .args(["rev-list", "--count", &range, "--"])
+        .arg(&project_path)
+        .current_dir(root)
+        .output()
+        .ok()?;
+
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
 /// Find all projects that have mirror configuration.
 pub fn find_mirrored_projects(root: &Path) -> Result<Vec<(String, MirrorConfig)>> {
     let projects_dir = root.join(PROJECTS_DIR);
@@ -413,9 +428,12 @@ pub fn find_mirrored_projects(root: &Path) -> Result<Vec<(String, MirrorConfig)>
 pub struct MirrorStatus {
     pub project: String,
     pub config: MirrorConfig,
-    pub mirror_exists: bool,
-    pub has_changes: bool,
-    pub has_unpushed: bool,
+    /// Last synced monorepo commit (None if mirror doesn't exist or no tag)
+    pub public_commit: Option<String>,
+    /// Latest monorepo commit touching this project
+    pub private_commit: String,
+    /// Number of commits between public and private (None if public unknown)
+    pub commits_ahead: Option<usize>,
 }
 
 /// Get status for all mirrored projects.
@@ -424,15 +442,23 @@ pub fn get_all_status(root: &Path) -> Result<Vec<MirrorStatus>> {
     let mut statuses = Vec::new();
 
     for (project, config) in projects {
-        let path = mirror_path(&config.org, &config.repo)?;
-        let exists = path.exists();
+        let mirror = mirror_path(&config.org, &config.repo)?;
+        let public_commit = if mirror.exists() {
+            get_synced_commit(&mirror)
+        } else {
+            None
+        };
+        let private_commit = get_latest_project_commit(root, &project)?;
+        let commits_ahead = public_commit
+            .as_ref()
+            .and_then(|pub_c| count_project_commits(root, &project, pub_c, &private_commit));
 
         statuses.push(MirrorStatus {
             project,
             config: config.clone(),
-            mirror_exists: exists,
-            has_changes: exists && has_uncommitted_changes(&path),
-            has_unpushed: exists && has_unpushed_commits(&path),
+            public_commit,
+            private_commit,
+            commits_ahead,
         });
     }
 

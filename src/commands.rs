@@ -826,15 +826,18 @@ pub fn cmd_decrypt(file: &Path, in_place: bool) -> Result<()> {
 /// Exit code indicating mirror is already synced (no work needed).
 pub const EXIT_ALREADY_SYNCED: u8 = 2;
 
+/// Exit code indicating secrets were found in the mirror.
+pub const EXIT_SECRETS_FOUND: u8 = 3;
+
 /// Result of mirror command - either success, already synced, or error.
-pub fn cmd_mirror(root: &Path, command: MirrorCommand) -> Result<Option<u8>> {
+pub fn cmd_mirror(root: &Path, command: MirrorCommand, use_color: bool) -> Result<Option<u8>> {
     match command {
-        MirrorCommand::Status => cmd_mirror_status(root).map(|()| None),
-        MirrorCommand::Diff { project } => cmd_mirror_diff(root, project),
+        MirrorCommand::Status => cmd_mirror_status(root, use_color).map(|()| None),
+        MirrorCommand::Diff { project, no_scan } => cmd_mirror_diff(root, project, no_scan),
     }
 }
 
-fn cmd_mirror_status(root: &Path) -> Result<()> {
+fn cmd_mirror_status(root: &Path, use_color: bool) -> Result<()> {
     let statuses = mirror::get_all_status(root)?;
 
     if statuses.is_empty() {
@@ -844,30 +847,35 @@ fn cmd_mirror_status(root: &Path) -> Result<()> {
         return Ok(());
     }
 
-    #[allow(clippy::print_stdout)]
-    {
-        for status in &statuses {
-            let state = if !status.mirror_exists {
-                "not cloned"
-            } else if status.has_changes {
-                "uncommitted changes"
-            } else if status.has_unpushed {
-                "unpushed commits"
-            } else {
-                "clean"
-            };
-
-            println!(
-                "{}: {}/{} ({})",
-                status.project, status.config.org, status.config.repo, state
-            );
-        }
-    }
-
+    let table = render_mirror_table(&statuses);
+    markdown::skin(use_color).print_text(&table);
     Ok(())
 }
 
-fn cmd_mirror_diff(root: &Path, project: Option<String>) -> Result<Option<u8>> {
+fn render_mirror_table(statuses: &[mirror::MirrorStatus]) -> String {
+    let mut md = String::new();
+    md.push_str("| Project | Remote | Public | Private |\n");
+    md.push_str("|:--------|:-------|:-------|:--------|\n");
+
+    for s in statuses {
+        let public = s.public_commit.as_ref().map(|c| &c[..7]).unwrap_or("?");
+
+        let private = match s.commits_ahead {
+            Some(0) => s.private_commit[..7].to_string(),
+            Some(n) => format!("{} (+{})", &s.private_commit[..7], n),
+            None => format!("{} (+?)", &s.private_commit[..7]),
+        };
+
+        md.push_str(&format!(
+            "| {} | {}/{} | {} | {} |\n",
+            s.project, s.config.org, s.config.repo, public, private
+        ));
+    }
+
+    md
+}
+
+fn cmd_mirror_diff(root: &Path, project: Option<String>, no_scan: bool) -> Result<Option<u8>> {
     // Resolve project name
     let project = match project {
         Some(p) => p,
@@ -936,5 +944,66 @@ fn cmd_mirror_diff(root: &Path, project: Option<String>) -> Result<Option<u8>> {
         mirror::HARDCODED_EXCLUDES
     );
 
+    // Run secret scan unless --no-scan was passed
+    if !no_scan {
+        if let Some(exit_code) = run_trufflehog_scan(&mirror_path)? {
+            return Ok(Some(exit_code));
+        }
+    }
+
     Ok(None)
+}
+
+/// Run trufflehog secret scan on the mirror directory.
+/// Returns Some(EXIT_SECRETS_FOUND) if secrets were detected, None if clean.
+fn run_trufflehog_scan(mirror_path: &Path) -> Result<Option<u8>> {
+    use std::process::Command;
+
+    let output = Command::new("trufflehog")
+        .args(["filesystem", "--fail"])
+        .arg(mirror_path)
+        .output();
+
+    let output = match output {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!(
+                "trufflehog not found in PATH. Install trufflehog or use --no-scan to skip secret scanning."
+            );
+        }
+        Err(e) => {
+            return Err(e).context("Failed to run trufflehog");
+        }
+    };
+
+    match output.status.code() {
+        Some(0) => {
+            info!("Secret scan passed");
+            Ok(None)
+        }
+        Some(183) => {
+            // Secrets found - trufflehog already printed findings to stdout/stderr
+            #[allow(clippy::print_stderr)]
+            {
+                // Ensure trufflehog output is visible
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stdout.is_empty() {
+                    eprintln!("{}", stdout);
+                }
+                if !stderr.is_empty() {
+                    eprintln!("{}", stderr);
+                }
+                eprintln!("Secret scan failed: potential secrets detected in mirror");
+            }
+            Ok(Some(EXIT_SECRETS_FOUND))
+        }
+        Some(code) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("trufflehog exited with code {}: {}", code, stderr.trim());
+        }
+        None => {
+            bail!("trufflehog was terminated by signal");
+        }
+    }
 }

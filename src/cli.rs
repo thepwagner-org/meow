@@ -114,6 +114,10 @@ pub enum MirrorCommand {
     Diff {
         /// Project name (defaults to current directory's project)
         project: Option<String>,
+
+        /// Skip secret scanning with trufflehog
+        #[arg(long)]
+        no_scan: bool,
     },
 }
 
