@@ -63,7 +63,17 @@ impl Default for Config {
 impl Config {
     /// Load config from ~/.config/meow/config.yaml (or XDG equivalent).
     /// Falls back to defaults if file doesn't exist.
+    ///
+    /// Environment variable overrides:
+    /// - `MEOW_REPO_PATH`: Override the repository path (useful for CI)
     pub fn load() -> Result<Self> {
+        // Environment variable takes precedence
+        if let Ok(repo_path) = env::var("MEOW_REPO_PATH") {
+            return Ok(Self {
+                repo_path: PathBuf::from(repo_path),
+            });
+        }
+
         let config_path = config_dir()?.join("config.yaml");
 
         if !config_path.exists() {

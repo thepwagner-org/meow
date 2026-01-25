@@ -11,7 +11,7 @@ const SIZE_WARNING_THRESHOLD: usize = 4000;
 /// Canonical related documents section injected into CLAUDE.md files.
 const RELATED_DOCS_SECTION: &str = r#"## Related Documents
 
-- **journal/** - Daily notes in `YYYY-MM.md` files. Log design discussions, investigations, and decisions with `### YYYY-MM-DD` headings.
+- **journal/** - Daily notes in `YYYY-MM.md` files. Log design discussions, investigations, and decisions with `## YYYY-MM-DD` headings.
 - **ROADMAP.md** - Future possibilities and explicit non-goals. Update when brainstorming; don't track completed work here.
 - **CLAUDE.md** - How to work on the project: architecture, commands, lints. Keep concise.
 - **../knowledge/** - Personal knowledge base. Read `CLAUDE.md` there for structure; schemas in `.meow.d/`.
@@ -273,7 +273,7 @@ mod tests {
 
 ## Related Documents
 
-- **journal/** - Daily notes in `YYYY-MM.md` files. Log design discussions, investigations, and decisions with `### YYYY-MM-DD` headings.
+- **journal/** - Daily notes in `YYYY-MM.md` files. Log design discussions, investigations, and decisions with `## YYYY-MM-DD` headings.
 - **ROADMAP.md** - Future possibilities and explicit non-goals. Update when brainstorming; don't track completed work here.
 - **CLAUDE.md** - How to work on the project: architecture, commands, lints. Keep concise.
 

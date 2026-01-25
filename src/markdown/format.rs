@@ -18,6 +18,8 @@ use walkdir::WalkDir;
 pub struct FormatOptions {
     /// Skip encrypted files entirely.
     pub skip_encrypted: bool,
+    /// Check mode: report files that would change but don't write.
+    pub check: bool,
 }
 
 /// Project encryption configuration resolved from README.md.
@@ -175,7 +177,9 @@ fn format_file(
             original_body_b64.as_deref(),
         )? {
             Some(formatted) => {
-                fs::write(path, &formatted).context("Failed to write encrypted markdown")?;
+                if !opts.check {
+                    fs::write(path, &formatted).context("Failed to write encrypted markdown")?;
+                }
                 Ok((true, vec![], custom_info))
             }
             None => {
@@ -192,7 +196,9 @@ fn format_file(
         };
 
         if formatted != content {
-            fs::write(path, &formatted).context("Failed to write formatted markdown")?;
+            if !opts.check {
+                fs::write(path, &formatted).context("Failed to write formatted markdown")?;
+            }
             Ok((true, vec![], custom_info))
         } else {
             Ok((false, vec![], custom_info))
@@ -331,7 +337,7 @@ pub fn format_project(
     }
 
     // Generate indexes for schemas that have index paths defined
-    generate_indexes(&schemas, &docs_by_type, &mut result);
+    generate_indexes(&schemas, &docs_by_type, &mut result, &opts);
 
     Ok(result)
 }
@@ -341,6 +347,7 @@ fn generate_indexes(
     schemas: &HashMap<PathBuf, Schema>,
     docs_by_type: &HashMap<(PathBuf, String), Vec<PathBuf>>,
     result: &mut FormatResult,
+    opts: &FormatOptions,
 ) {
     for (schema_dir, schema) in schemas {
         // Schema parent is directory containing .meow.d
@@ -368,7 +375,10 @@ fn generate_indexes(
             // Read existing content to check if changed
             let existing = fs::read_to_string(&full_index_path).unwrap_or_default();
             if content != existing {
-                if let Err(e) = fs::write(&full_index_path, &content) {
+                if opts.check {
+                    // In check mode, just count the file as needing formatting
+                    result.files_formatted += 1;
+                } else if let Err(e) = fs::write(&full_index_path, &content) {
                     result.errors.push(FileError {
                         path: full_index_path.display().to_string(),
                         errors: vec![ValidationError {

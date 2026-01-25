@@ -352,25 +352,33 @@ pub fn cmd_fmt(repo: &Repository, root: &Path, args: FmtArgs) -> Result<()> {
     // Load git tree for link validation (works on files not in sparse checkout)
     let git_tree = git::list_all_paths(repo)?;
     let mut has_errors = false;
+    let mut needs_formatting = false;
 
     let opts = markdown::FormatOptions {
         skip_encrypted: args.skip_encrypted,
+        check: args.check,
     };
 
     for project in &projects {
         let result = markdown::format_project(root, project, Some(&git_tree), opts)?;
-        if print_format_result(project, &result).is_err() {
+        if print_format_result(project, &result, args.check).is_err() {
             has_errors = true;
+        }
+        if result.files_formatted > 0 {
+            needs_formatting = true;
         }
     }
 
     if has_errors {
         anyhow::bail!("formatting failed")
     }
+    if args.check && needs_formatting {
+        anyhow::bail!("files need formatting")
+    }
     Ok(())
 }
 
-fn print_format_result(project: &str, result: &markdown::FormatResult) -> Result<()> {
+fn print_format_result(project: &str, result: &markdown::FormatResult, check: bool) -> Result<()> {
     #[allow(clippy::print_stdout)]
     {
         if result.files_checked == 0 {
@@ -378,7 +386,11 @@ fn print_format_result(project: &str, result: &markdown::FormatResult) -> Result
             return Ok(());
         }
 
-        println!("Formatting {project}...");
+        if check {
+            println!("Checking {project}...");
+        } else {
+            println!("Formatting {project}...");
+        }
 
         for error in &result.errors {
             for e in &error.errors {
@@ -392,9 +404,14 @@ fn print_format_result(project: &str, result: &markdown::FormatResult) -> Result
 
         if result.errors.is_empty() {
             if result.files_formatted > 0 {
+                let verb = if check {
+                    "need formatting"
+                } else {
+                    "formatted"
+                };
                 println!(
-                    "{} files checked, {} formatted",
-                    result.files_checked, result.files_formatted
+                    "{} files checked, {} {}",
+                    result.files_checked, result.files_formatted, verb
                 );
             } else {
                 println!("{} files checked, all ok", result.files_checked);

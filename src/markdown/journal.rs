@@ -33,9 +33,9 @@ pub fn validate(doc: &Document, ctx: &FormatContext) -> Vec<ValidationError> {
         });
     }
 
-    // Check H3s are valid dates (with optional time)
+    // Check H2s are valid dates (with optional time)
     for block in &doc.blocks {
-        if let Block::Heading { level: 3, content } = block {
+        if let Block::Heading { level: 2, content } = block {
             let text = inlines_to_string(content);
             if let Some((date, _time)) = parse_journal_heading(&text) {
                 // Check date matches year_month
@@ -59,10 +59,10 @@ pub fn validate(doc: &Document, ctx: &FormatContext) -> Vec<ValidationError> {
         // Check for malformed headings (parsed as paragraphs because missing space after #)
         if let Block::Paragraph(content) = block {
             let text = inlines_to_string(content);
-            if text.starts_with("###") {
+            if text.starts_with("##") && !text.starts_with("## ") {
                 errors.push(ValidationError {
                     line: 0,
-                    message: format!("malformed heading: {text:?} (missing space after ###)"),
+                    message: format!("malformed heading: {text:?} (missing space after ##)"),
                 });
             }
         }
@@ -77,6 +77,19 @@ pub fn validate(doc: &Document, ctx: &FormatContext) -> Vec<ValidationError> {
 /// Normalize a journal document in place.
 pub fn normalize(doc: &mut Document, ctx: &FormatContext) {
     let year_month = ctx.year_month.as_deref().unwrap_or("unknown");
+
+    // Migrate legacy H3 date headings to H2
+    for block in &mut doc.blocks {
+        if let Block::Heading { level: 3, content } = block {
+            let text = inlines_to_string(content);
+            if parse_journal_heading(&text).is_some() {
+                *block = Block::Heading {
+                    level: 2,
+                    content: content.clone(),
+                };
+            }
+        }
+    }
 
     // Ensure H1 month heading exists and is correct
     let month_name = generate_month_name(year_month);
@@ -141,7 +154,7 @@ struct ParsedJournal {
 }
 
 /// Parse blocks into preamble and entries.
-/// Entries are (date, optional_time, blocks including H3 heading).
+/// Entries are (date, optional_time, blocks including H2 heading).
 fn parse_journal_blocks(blocks: impl IntoIterator<Item = Block>) -> ParsedJournal {
     let mut preamble = Vec::new();
     let mut entries = Vec::new();
@@ -151,7 +164,7 @@ fn parse_journal_blocks(blocks: impl IntoIterator<Item = Block>) -> ParsedJourna
 
     for block in blocks {
         if let Block::Heading {
-            level: 3,
+            level: 2,
             ref content,
         } = block
         {
@@ -327,10 +340,10 @@ pub fn render_entries(project: &str, entries: &[JournalEntry]) -> String {
         };
         out.push_str(&format!("## {heading}\n"));
 
-        // Render content blocks (skip the H3 date heading and blank lines)
+        // Render content blocks (skip the H2 date heading and blank lines)
         for block in &entry.blocks {
             match block {
-                Block::Heading { level: 3, .. } | Block::BlankLine => {
+                Block::Heading { level: 2, .. } | Block::BlankLine => {
                     // Skip - we already rendered the date, and control spacing ourselves
                 }
                 _ => {
@@ -367,10 +380,10 @@ pub fn render_timeline(project: &str, items: &[TimelineItem]) -> String {
                 };
                 out.push_str(&format!("## {heading}\n"));
 
-                // Render content blocks (skip the H3 date heading and blank lines)
+                // Render content blocks (skip the H2 date heading and blank lines)
                 for block in &entry.blocks {
                     match block {
-                        Block::Heading { level: 3, .. } | Block::BlankLine => {
+                        Block::Heading { level: 2, .. } | Block::BlankLine => {
                             // Skip - we already rendered the date, and control spacing ourselves
                         }
                         _ => {
@@ -427,10 +440,10 @@ mod tests {
     fn test_parse_and_format_journal() {
         let content = r#"# November 2025
 
-### 2025-11-28
+## 2025-11-28
 - Earlier entry
 
-### 2025-11-29
+## 2025-11-29
 - Later entry
 "#;
         let mut doc = parse(content);
@@ -444,10 +457,36 @@ mod tests {
     }
 
     #[test]
+    fn test_migrate_h3_to_h2() {
+        // Legacy H3 date headings should be migrated to H2
+        let content = r#"# November 2025
+
+### 2025-11-28
+- Earlier entry
+
+### 2025-11-29
+- Later entry
+"#;
+        let mut doc = parse(content);
+        normalize(&mut doc, &make_ctx("2025-11"));
+        let formatted = serialize(&doc);
+
+        // Should have H2 headings after migration
+        assert!(
+            formatted.contains("## 2025-11-29"),
+            "should migrate to H2: {formatted}"
+        );
+        assert!(
+            !formatted.contains("### 2025-11-29"),
+            "should not have H3: {formatted}"
+        );
+    }
+
+    #[test]
     fn test_validate_invalid_date() {
         let content = r#"# November 2025
 
-### Nov 29
+## Nov 29
 - Bad date format
 "#;
         let doc = parse(content);
@@ -457,13 +496,13 @@ mod tests {
 
     #[test]
     fn test_validate_malformed_heading() {
-        // Missing space after ### - CommonMark parses this as a paragraph, not a heading
+        // Missing space after ## - CommonMark parses this as a paragraph, not a heading
         let content = r#"# November 2025
 
-### 2025-11-30
+## 2025-11-30
 Good entry.
 
-###2025-11-30 broken entry
+##2025-11-30 broken entry
 Bad entry.
 "#;
         let doc = parse(content);
@@ -514,13 +553,13 @@ Bad entry.
     fn test_multiple_same_day_entries_with_times() {
         let content = r#"# November 2025
 
-### 2025-11-29 09:00
+## 2025-11-29 09:00
 - Morning work
 
-### 2025-11-29 14:30
+## 2025-11-29 14:30
 - Afternoon work
 
-### 2025-11-29
+## 2025-11-29
 - Entry without time (sorts last for the day)
 "#;
         let mut doc = parse(content);
@@ -528,9 +567,9 @@ Bad entry.
         let formatted = serialize(&doc);
 
         // Entry without time (23:59) should come first, then 14:30, then 09:00
-        let pos_no_time = formatted.find("### 2025-11-29\n").expect("no time");
-        let pos_14_30 = formatted.find("### 2025-11-29 14:30").expect("14:30");
-        let pos_09_00 = formatted.find("### 2025-11-29 09:00").expect("09:00");
+        let pos_no_time = formatted.find("## 2025-11-29\n").expect("no time");
+        let pos_14_30 = formatted.find("## 2025-11-29 14:30").expect("14:30");
+        let pos_09_00 = formatted.find("## 2025-11-29 09:00").expect("09:00");
         assert!(
             pos_no_time < pos_14_30,
             "no-time entry should come before 14:30"
@@ -542,7 +581,7 @@ Bad entry.
     fn test_validate_accepts_timestamps() {
         let content = r#"# November 2025
 
-### 2025-11-29 14:30
+## 2025-11-29 14:30
 - Entry with time
 "#;
         let doc = parse(content);

@@ -141,6 +141,10 @@ pub struct FmtArgs {
     /// Skip encrypted files (don't decrypt/re-encrypt)
     #[arg(long)]
     pub skip_encrypted: bool,
+
+    /// Check if files are formatted without writing changes (exits non-zero if changes needed)
+    #[arg(long)]
+    pub check: bool,
 }
 
 #[derive(Args, Debug)]
