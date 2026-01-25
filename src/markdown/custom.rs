@@ -768,13 +768,131 @@ fn validate_field_type(
             // Note: Link existence validation requires ctx, handled separately
         }
         FieldType::List => {
-            if !value.is_sequence() && !value.is_null() {
+            if let Some(seq) = value.as_sequence() {
+                if let Some(item_type) = &field_def.item_type {
+                    for (i, item) in seq.iter().enumerate() {
+                        validate_list_item(field_name, i, item, item_type, field_def, errors);
+                    }
+                }
+            } else if !value.is_null() {
                 errors.push(ValidationError {
                     line: 0,
                     message: format!("field '{}' must be a list", field_name),
                 });
             }
-            // Item type validation could be added here
+        }
+    }
+}
+
+/// Validate a single item in a list field.
+fn validate_list_item(
+    field_name: &str,
+    index: usize,
+    item: &serde_yaml::Value,
+    item_type: &FieldType,
+    field_def: &super::schema::FieldDef,
+    errors: &mut Vec<ValidationError>,
+) {
+    let item_name = format!("{}[{}]", field_name, index);
+
+    match item_type {
+        FieldType::String => {
+            if !item.is_string() {
+                errors.push(ValidationError {
+                    line: 0,
+                    message: format!("field '{}' must be a string", item_name),
+                });
+            }
+        }
+        FieldType::Date => {
+            if let Some(s) = item.as_str() {
+                if parse_date(s).is_none() {
+                    errors.push(ValidationError {
+                        line: 0,
+                        message: format!(
+                            "field '{}' must be a valid date (got '{}')",
+                            item_name, s
+                        ),
+                    });
+                }
+            } else {
+                errors.push(ValidationError {
+                    line: 0,
+                    message: format!("field '{}' must be a date string", item_name),
+                });
+            }
+        }
+        FieldType::Datetime => {
+            if let Some(s) = item.as_str() {
+                if parse_datetime(s).is_none() {
+                    errors.push(ValidationError {
+                        line: 0,
+                        message: format!(
+                            "field '{}' must be a valid datetime (got '{}')",
+                            item_name, s
+                        ),
+                    });
+                }
+            } else {
+                errors.push(ValidationError {
+                    line: 0,
+                    message: format!("field '{}' must be a datetime string", item_name),
+                });
+            }
+        }
+        FieldType::Integer => {
+            if !item.is_i64() && !item.is_u64() {
+                errors.push(ValidationError {
+                    line: 0,
+                    message: format!("field '{}' must be an integer", item_name),
+                });
+            }
+        }
+        FieldType::Bool => {
+            if !item.is_bool() {
+                errors.push(ValidationError {
+                    line: 0,
+                    message: format!("field '{}' must be a boolean", item_name),
+                });
+            }
+        }
+        FieldType::Enum => {
+            if let Some(valid_values) = &field_def.values {
+                if let Some(s) = item.as_str() {
+                    if !valid_values.contains(&s.to_string()) {
+                        errors.push(ValidationError {
+                            line: 0,
+                            message: format!(
+                                "field '{}' must be one of: {} (got '{}')",
+                                item_name,
+                                valid_values.join(", "),
+                                s
+                            ),
+                        });
+                    }
+                } else {
+                    errors.push(ValidationError {
+                        line: 0,
+                        message: format!("field '{}' must be a string enum value", item_name),
+                    });
+                }
+            }
+        }
+        FieldType::Link => {
+            if !item.is_string() {
+                errors.push(ValidationError {
+                    line: 0,
+                    message: format!("field '{}' must be a link string", item_name),
+                });
+            }
+            // Note: Link existence validation handled separately
+        }
+        FieldType::List => {
+            // Nested lists not supported
+            errors.push(ValidationError {
+                line: 0,
+                message: format!("field '{}': nested lists are not supported", item_name),
+            });
         }
     }
 }
@@ -1816,5 +1934,250 @@ type: threat
             "expected backlink error, got: {}",
             errors[0].message
         );
+    }
+
+    #[test]
+    fn test_validate_list_of_enum() {
+        let schema = make_schema(
+            "task",
+            r#"
+fields:
+  tags:
+    type: list
+    item_type: enum
+    values: [work, personal, health]
+"#,
+        );
+
+        // Valid list of enums
+        let doc = parse(
+            r#"---
+type: task
+tags:
+  - work
+  - health
+---
+# Task
+"#,
+        );
+
+        let ctx = FormatContext {
+            project: "test",
+            path: std::path::Path::new("test.md"),
+            year_month: None,
+            git_tree: None,
+            repo_root: None,
+        };
+
+        let errors = validate(&doc, &ctx, &schema, "task");
+        assert!(errors.is_empty(), "expected no errors, got: {:?}", errors);
+    }
+
+    #[test]
+    fn test_validate_list_of_enum_invalid_value() {
+        let schema = make_schema(
+            "task",
+            r#"
+fields:
+  tags:
+    type: list
+    item_type: enum
+    values: [work, personal, health]
+"#,
+        );
+
+        // Invalid enum value in list
+        let doc = parse(
+            r#"---
+type: task
+tags:
+  - work
+  - invalid
+  - health
+---
+# Task
+"#,
+        );
+
+        let ctx = FormatContext {
+            project: "test",
+            path: std::path::Path::new("test.md"),
+            year_month: None,
+            git_tree: None,
+            repo_root: None,
+        };
+
+        let errors = validate(&doc, &ctx, &schema, "task");
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].message.contains("tags[1]"),
+            "expected indexed error, got: {}",
+            errors[0].message
+        );
+        assert!(errors[0].message.contains("must be one of"));
+    }
+
+    #[test]
+    fn test_validate_list_of_strings() {
+        let schema = make_schema(
+            "doc",
+            r#"
+fields:
+  names:
+    type: list
+    item_type: string
+"#,
+        );
+
+        let doc = parse(
+            r#"---
+type: doc
+names:
+  - alice
+  - bob
+---
+# Doc
+"#,
+        );
+
+        let ctx = FormatContext {
+            project: "test",
+            path: std::path::Path::new("test.md"),
+            year_month: None,
+            git_tree: None,
+            repo_root: None,
+        };
+
+        let errors = validate(&doc, &ctx, &schema, "doc");
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_validate_list_of_integers() {
+        let schema = make_schema(
+            "doc",
+            r#"
+fields:
+  counts:
+    type: list
+    item_type: integer
+"#,
+        );
+
+        // Valid integers
+        let doc = parse(
+            r#"---
+type: doc
+counts:
+  - 1
+  - 2
+  - 3
+---
+# Doc
+"#,
+        );
+
+        let ctx = FormatContext {
+            project: "test",
+            path: std::path::Path::new("test.md"),
+            year_month: None,
+            git_tree: None,
+            repo_root: None,
+        };
+
+        let errors = validate(&doc, &ctx, &schema, "doc");
+        assert!(errors.is_empty());
+
+        // Invalid: string in integer list
+        let doc = parse(
+            r#"---
+type: doc
+counts:
+  - 1
+  - not_a_number
+---
+# Doc
+"#,
+        );
+
+        let errors = validate(&doc, &ctx, &schema, "doc");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("counts[1]"));
+        assert!(errors[0].message.contains("must be an integer"));
+    }
+
+    #[test]
+    fn test_validate_empty_list() {
+        let schema = make_schema(
+            "task",
+            r#"
+fields:
+  tags:
+    type: list
+    item_type: enum
+    values: [work, personal]
+"#,
+        );
+
+        // Empty list is valid
+        let doc = parse(
+            r#"---
+type: task
+tags: []
+---
+# Task
+"#,
+        );
+
+        let ctx = FormatContext {
+            project: "test",
+            path: std::path::Path::new("test.md"),
+            year_month: None,
+            git_tree: None,
+            repo_root: None,
+        };
+
+        let errors = validate(&doc, &ctx, &schema, "task");
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_validate_list_multiple_errors() {
+        let schema = make_schema(
+            "task",
+            r#"
+fields:
+  tags:
+    type: list
+    item_type: enum
+    values: [a, b, c]
+"#,
+        );
+
+        // Multiple invalid values
+        let doc = parse(
+            r#"---
+type: task
+tags:
+  - a
+  - x
+  - b
+  - y
+  - z
+---
+# Task
+"#,
+        );
+
+        let ctx = FormatContext {
+            project: "test",
+            path: std::path::Path::new("test.md"),
+            year_month: None,
+            git_tree: None,
+            repo_root: None,
+        };
+
+        let errors = validate(&doc, &ctx, &schema, "task");
+        assert_eq!(errors.len(), 3, "expected 3 errors, got: {:?}", errors);
     }
 }

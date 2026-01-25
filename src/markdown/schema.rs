@@ -38,6 +38,18 @@ pub struct TypeDef {
     pub index: Option<String>,
 }
 
+impl TypeDef {
+    /// Validate the type definition is internally consistent.
+    pub fn validate(&self, type_name: &str) -> Result<()> {
+        for (field_name, field_def) in &self.fields {
+            field_def
+                .validate(field_name)
+                .with_context(|| format!("in type '{}'", type_name))?;
+        }
+        Ok(())
+    }
+}
+
 /// Document structure definition.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct StructureDef {
@@ -120,6 +132,38 @@ pub struct FieldDef {
     /// Item type for list fields.
     #[serde(default)]
     pub item_type: Option<FieldType>,
+}
+
+impl FieldDef {
+    /// Validate the field definition is internally consistent.
+    ///
+    /// Checks:
+    /// - Enum fields must have non-empty `values`
+    /// - List fields with enum item_type must have non-empty `values`
+    pub fn validate(&self, field_name: &str) -> Result<()> {
+        match self.field_type {
+            FieldType::Enum => {
+                if self.values.as_ref().is_none_or(|v| v.is_empty()) {
+                    anyhow::bail!(
+                        "field '{}': enum type requires non-empty 'values'",
+                        field_name
+                    );
+                }
+            }
+            FieldType::List => {
+                if self.item_type == Some(FieldType::Enum)
+                    && self.values.as_ref().is_none_or(|v| v.is_empty())
+                {
+                    anyhow::bail!(
+                        "field '{}': list of enum requires non-empty 'values'",
+                        field_name
+                    );
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 /// Types of frontmatter fields.
@@ -384,6 +428,10 @@ impl Schema {
             let type_def: TypeDef = serde_yaml::from_str(&content)
                 .with_context(|| format!("failed to parse type file: {}", path.display()))?;
 
+            type_def
+                .validate(type_name)
+                .with_context(|| format!("invalid type file: {}", path.display()))?;
+
             let _ = schema.types.insert(type_name.to_string(), type_def);
         }
 
@@ -633,5 +681,94 @@ description: "A simple type"
 "#;
         let type_def: TypeDef = serde_yaml::from_str(yaml).expect("should parse");
         assert!(type_def.structure.frontmatter.is_empty());
+    }
+
+    #[test]
+    fn test_enum_requires_values() {
+        let yaml = r#"
+fields:
+  status:
+    type: enum
+"#;
+        let type_def: TypeDef = serde_yaml::from_str(yaml).expect("should parse");
+        let result = type_def.validate("test");
+        let err = result.expect_err("should fail without values");
+        // Use debug format to see full error chain
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("enum type requires non-empty 'values'"),
+            "expected enum error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_enum_with_empty_values_fails() {
+        let yaml = r#"
+fields:
+  status:
+    type: enum
+    values: []
+"#;
+        let type_def: TypeDef = serde_yaml::from_str(yaml).expect("should parse");
+        let result = type_def.validate("test");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_enum_with_values_succeeds() {
+        let yaml = r#"
+fields:
+  status:
+    type: enum
+    values: [active, inactive]
+"#;
+        let type_def: TypeDef = serde_yaml::from_str(yaml).expect("should parse");
+        assert!(type_def.validate("test").is_ok());
+    }
+
+    #[test]
+    fn test_list_of_enum_requires_values() {
+        let yaml = r#"
+fields:
+  tags:
+    type: list
+    item_type: enum
+"#;
+        let type_def: TypeDef = serde_yaml::from_str(yaml).expect("should parse");
+        let result = type_def.validate("test");
+        let err = result.expect_err("should fail without values");
+        // Use debug format to see full error chain
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("list of enum requires non-empty 'values'"),
+            "expected list-of-enum error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_list_of_enum_with_values_succeeds() {
+        let yaml = r#"
+fields:
+  tags:
+    type: list
+    item_type: enum
+    values: [work, personal, health]
+"#;
+        let type_def: TypeDef = serde_yaml::from_str(yaml).expect("should parse");
+        assert!(type_def.validate("test").is_ok());
+    }
+
+    #[test]
+    fn test_list_of_string_does_not_require_values() {
+        let yaml = r#"
+fields:
+  names:
+    type: list
+    item_type: string
+"#;
+        let type_def: TypeDef = serde_yaml::from_str(yaml).expect("should parse");
+        assert!(type_def.validate("test").is_ok());
     }
 }
