@@ -1,20 +1,23 @@
 use anyhow::Result;
 use clap::Parser;
 use meow::cli::{Cli, Command};
-use meow::{color, commands, git};
+use meow::{color, commands, git, lsp};
 use std::process::ExitCode;
 use tracing::error;
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("meow=info")),
-        )
-        .with_writer(std::io::stderr)
-        .without_time()
-        .with_target(false)
-        .init();
+    // Skip tracing setup for LSP (uses stdio for protocol)
+    if !std::env::args().any(|a| a == "lsp") {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("meow=info")),
+            )
+            .with_writer(std::io::stderr)
+            .without_time()
+            .with_target(false)
+            .init();
+    }
 
     match run() {
         Ok(None) => ExitCode::SUCCESS,
@@ -93,5 +96,7 @@ fn run() -> Result<Option<u8>> {
         Command::Pull => commands::cmd_pull(&root).map(|()| None),
 
         Command::Mirror { command } => commands::cmd_mirror(&root, command, use_color),
+
+        Command::Lsp => lsp::run().map(|()| None),
     }
 }

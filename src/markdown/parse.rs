@@ -20,9 +20,14 @@ pub fn parse(content: &str) -> Document {
     let events: VecDeque<Event> = parser.collect();
     let blocks = parse_blocks(events);
 
+    // Compute 1-based line numbers for each block
+    let fm_lines = count_frontmatter_lines(content);
+    let block_lines = compute_block_lines(&parsed.content, &blocks, fm_lines);
+
     Document {
         frontmatter,
         blocks,
+        block_lines,
     }
 }
 
@@ -44,10 +49,13 @@ pub fn parse_encrypted(content: &str) -> Result<(Document, Option<String>)> {
         let parser = Parser::new(&parsed.content);
         let events: VecDeque<Event> = parser.collect();
         let blocks = parse_blocks(events);
+        let fm_lines = count_frontmatter_lines(content);
+        let block_lines = compute_block_lines(&parsed.content, &blocks, fm_lines);
         return Ok((
             Document {
                 frontmatter,
                 blocks,
+                block_lines,
             },
             None,
         ));
@@ -79,10 +87,13 @@ pub fn parse_encrypted(content: &str) -> Result<(Document, Option<String>)> {
     let blocks = parse_blocks(events);
 
     // Return document and original body for change detection
+    // Encrypted docs get zeroed line numbers (meaningless for encrypted content)
+    let block_lines = vec![0; blocks.len()];
     Ok((
         Document {
             frontmatter,
             blocks,
+            block_lines,
         },
         Some(body_trimmed.to_string()),
     ))
@@ -419,6 +430,80 @@ fn normalize_blank_lines(blocks: &mut Vec<Block>) {
         }
         i += 1;
     }
+}
+
+/// Count the number of lines occupied by YAML frontmatter (including `---` delimiters).
+/// Returns 0 if there is no frontmatter.
+fn count_frontmatter_lines(content: &str) -> usize {
+    if !content.starts_with("---") {
+        return 0;
+    }
+    // Find the closing `---` after the opening one
+    if let Some(end) = content[3..].find("\n---") {
+        // +1 for opening `---\n`, count lines in between, +1 for closing `---\n`
+        let frontmatter_section = &content[..3 + end + 4]; // "---\n...\n---"
+        frontmatter_section.lines().count()
+    } else {
+        0
+    }
+}
+
+/// Compute 1-based line numbers for each block.
+///
+/// Uses `pulldown_cmark`'s offset iterator to map block-start byte offsets
+/// to line numbers. `Block::BlankLine` entries (synthetic, from `normalize_blank_lines`)
+/// are assigned line 0 (unknown).
+fn compute_block_lines(body: &str, blocks: &[Block], fm_lines: usize) -> Vec<usize> {
+    use pulldown_cmark::{Event, Options, Tag};
+
+    // Build a line-start offset table for the body
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(body.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+
+    // Collect byte offsets of top-level block-start events
+    let parser = pulldown_cmark::Parser::new_ext(body, Options::empty());
+    let mut block_offsets: Vec<usize> = Vec::new();
+    let mut depth: usize = 0;
+
+    for (event, range) in parser.into_offset_iter() {
+        match &event {
+            Event::Start(Tag::Heading { .. })
+            | Event::Start(Tag::Paragraph)
+            | Event::Start(Tag::List(_))
+            | Event::Start(Tag::CodeBlock(_)) => {
+                if depth == 0 {
+                    block_offsets.push(range.start);
+                }
+                depth += 1;
+            }
+            Event::End(_) => {
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
+    // Map each block to a line number
+    let mut offset_idx = 0;
+    let mut result = Vec::with_capacity(blocks.len());
+
+    for block in blocks {
+        if matches!(block, Block::BlankLine) {
+            result.push(0);
+        } else if offset_idx < block_offsets.len() {
+            let byte_offset = block_offsets[offset_idx];
+            // Binary search for the line containing this offset
+            let line_idx = line_starts.partition_point(|&start| start <= byte_offset);
+            // line_idx is 1-based within body; add fm_lines for absolute line number
+            result.push(line_idx + fm_lines);
+            offset_idx += 1;
+        } else {
+            result.push(0);
+        }
+    }
+
+    result
 }
 
 fn heading_level_to_u8(level: HeadingLevel) -> u8 {

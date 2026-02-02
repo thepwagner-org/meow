@@ -36,4 +36,7 @@ meow z <project> feature-name  # in new worktree
 meow pull           # git pull
 meow prune          # clean up worktrees
 meow decrypt <file> # decrypt encrypted markdown
+
+# Start LSP server (markdown diagnostics)
+meow lsp
 ```

@@ -36,6 +36,9 @@ use std::path::Path;
 pub struct Document {
     pub frontmatter: Option<Frontmatter>,
     pub blocks: Vec<Block>,
+    /// 1-based line number for each block (parallel to `blocks`).
+    /// Populated by the parser using pulldown-cmark byte offsets.
+    pub block_lines: Vec<usize>,
 }
 
 /// YAML frontmatter fields.
@@ -112,11 +115,327 @@ pub enum Inline {
     SoftBreak,
 }
 
-/// A validation error with line number.
-#[derive(Debug)]
-pub struct ValidationError {
-    pub line: usize,
-    pub message: String,
+/// A validation error or fixable issue.
+///
+/// Each variant carries enough context to:
+/// - Report a diagnostic (line number + message)
+/// - Apply a fix if the issue is fixable
+#[derive(Debug, Clone)]
+pub enum ValidationError {
+    // === Unfixable errors (require user action) ===
+    /// Frontmatter is completely missing.
+    MissingFrontmatter,
+    /// A required frontmatter field is missing.
+    MissingRequiredField { line: usize, field: String },
+    /// A field has an invalid type or value.
+    InvalidFieldValue {
+        line: usize,
+        field: String,
+        message: String,
+    },
+    /// A date string is in an invalid format.
+    InvalidDateFormat { line: usize, text: String },
+    /// A journal entry date doesn't match the file's year-month.
+    DateFileMismatch {
+        line: usize,
+        date: String,
+        expected_prefix: String,
+    },
+    /// A heading is malformed (e.g., missing space after ##).
+    MalformedHeading { line: usize, text: String },
+    /// A link target doesn't exist or is invalid.
+    BrokenLink {
+        line: usize,
+        target: String,
+        reason: String,
+    },
+    /// File is too large (warning).
+    FileTooLarge {
+        line: usize,
+        size: usize,
+        threshold: usize,
+    },
+    /// Schema-related error.
+    SchemaError { line: usize, message: String },
+    /// Section structure error (wrong order, unexpected section, etc).
+    SectionError { line: usize, message: String },
+    /// Missing required section.
+    MissingSection { section: String },
+    /// I/O error (file write failed, etc).
+    IoError { line: usize, message: String },
+
+    // === Fixable issues (normalize() handles these) ===
+    /// H1 heading is missing; should be created with expected title.
+    MissingH1 { expected: String },
+    /// H1 heading doesn't match expected title.
+    H1Mismatch { expected: String },
+    /// Journal month H1 is missing.
+    MissingMonthH1 { month_name: String },
+    /// Legacy H3 date heading should be H2.
+    LegacyH3Heading { date_text: String },
+    /// Journal entries are out of order (should be newest-first).
+    EntriesOutOfOrder {
+        preamble: Vec<Block>,
+        sorted_entries: Vec<(chrono::NaiveDate, Option<chrono::NaiveTime>, Vec<Block>)>,
+    },
+    /// CLAUDE.md Related Documents section needs updating.
+    RelatedDocsNeedsUpdate {
+        /// Index of existing section (if any), or None to append.
+        section_start: Option<usize>,
+        /// End index of section(s) to replace.
+        section_end: usize,
+        /// Template blocks to insert.
+        template_blocks: Vec<Block>,
+        /// Custom content to preserve after template.
+        custom_content: Vec<Block>,
+    },
+    /// ROADMAP.md Non-Goals section needs intro paragraph.
+    NonGoalsNeedsIntro {
+        /// Index where intro should be inserted.
+        insert_idx: usize,
+    },
+    /// Date/datetime field needs normalization.
+    DateNeedsNormalization { field: String, normalized: String },
+    /// Empty optional section should be removed.
+    EmptyOptionalSection { section_indices: Vec<usize> },
+}
+
+impl ValidationError {
+    /// Get the line number for this error (1-based, 0 = unknown).
+    pub fn line(&self) -> usize {
+        match self {
+            Self::MissingFrontmatter => 1,
+            Self::MissingRequiredField { line, .. } => *line,
+            Self::InvalidFieldValue { line, .. } => *line,
+            Self::InvalidDateFormat { line, .. } => *line,
+            Self::DateFileMismatch { line, .. } => *line,
+            Self::MalformedHeading { line, .. } => *line,
+            Self::BrokenLink { line, .. } => *line,
+            Self::FileTooLarge { line, .. } => *line,
+            Self::SchemaError { line, .. } => *line,
+            Self::SectionError { line, .. } => *line,
+            Self::MissingSection { .. } => 1,
+            Self::IoError { line, .. } => *line,
+            // Fixable issues
+            Self::MissingH1 { .. } => 1,
+            Self::H1Mismatch { .. } => 1,
+            Self::MissingMonthH1 { .. } => 1,
+            Self::LegacyH3Heading { .. } => 1,
+            Self::EntriesOutOfOrder { .. } => 1,
+            Self::RelatedDocsNeedsUpdate { .. } => 1,
+            Self::NonGoalsNeedsIntro { .. } => 1,
+            Self::DateNeedsNormalization { .. } => 1,
+            Self::EmptyOptionalSection { .. } => 1,
+        }
+    }
+
+    /// Get a human-readable message for this error.
+    pub fn message(&self) -> String {
+        let base = match self {
+            Self::MissingFrontmatter => "missing frontmatter".to_string(),
+            Self::MissingRequiredField { field, .. } => {
+                format!("missing required field '{}'", field)
+            }
+            Self::InvalidFieldValue { field, message, .. } => {
+                format!("field '{}': {}", field, message)
+            }
+            Self::InvalidDateFormat { text, .. } => {
+                format!(
+                    "invalid date format: {:?} (expected YYYY-MM-DD or YYYY-MM-DD HH:MM)",
+                    text
+                )
+            }
+            Self::DateFileMismatch {
+                date,
+                expected_prefix,
+                ..
+            } => {
+                format!("date {} doesn't match file {}", date, expected_prefix)
+            }
+            Self::MalformedHeading { text, .. } => {
+                format!("malformed heading: {:?} (missing space after ##)", text)
+            }
+            Self::BrokenLink { target, reason, .. } => {
+                format!("broken link '{}': {}", target, reason)
+            }
+            Self::FileTooLarge {
+                size, threshold, ..
+            } => {
+                format!(
+                    "file is large ({} bytes, threshold: {}). Consider condensing.",
+                    size, threshold
+                )
+            }
+            Self::SchemaError { message, .. } => message.clone(),
+            Self::SectionError { message, .. } => message.clone(),
+            Self::MissingSection { section } => {
+                format!("missing required section '{}'", section)
+            }
+            Self::IoError { message, .. } => message.clone(),
+            // Fixable issues
+            Self::MissingH1 { expected } => {
+                format!("missing H1 heading (expected '{}')", expected)
+            }
+            Self::H1Mismatch { expected } => {
+                format!("H1 heading should be '{}'", expected)
+            }
+            Self::MissingMonthH1 { month_name } => {
+                format!("missing month heading (# {})", month_name)
+            }
+            Self::LegacyH3Heading { date_text } => {
+                format!("legacy H3 heading '{}' should be H2", date_text)
+            }
+            Self::EntriesOutOfOrder { .. } => {
+                "journal entries are out of order (should be newest first)".to_string()
+            }
+            Self::RelatedDocsNeedsUpdate { .. } => {
+                "Related Documents section needs updating".to_string()
+            }
+            Self::NonGoalsNeedsIntro { .. } => {
+                "Non-Goals section needs intro paragraph".to_string()
+            }
+            Self::DateNeedsNormalization { field, normalized } => {
+                format!("field '{}' normalized to '{}'", field, normalized)
+            }
+            Self::EmptyOptionalSection { .. } => {
+                "empty optional section(s) will be removed".to_string()
+            }
+        };
+
+        if self.is_fixable() {
+            format!("{base} (run meow fmt to fix)")
+        } else {
+            base
+        }
+    }
+
+    /// Returns true if this issue can be automatically fixed.
+    pub fn is_fixable(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingH1 { .. }
+                | Self::H1Mismatch { .. }
+                | Self::MissingMonthH1 { .. }
+                | Self::LegacyH3Heading { .. }
+                | Self::EntriesOutOfOrder { .. }
+                | Self::RelatedDocsNeedsUpdate { .. }
+                | Self::NonGoalsNeedsIntro { .. }
+                | Self::DateNeedsNormalization { .. }
+                | Self::EmptyOptionalSection { .. }
+        )
+    }
+
+    /// Apply the fix for this issue. No-op if not fixable.
+    pub fn fix(&self, doc: &mut Document) {
+        match self {
+            Self::MissingH1 { expected } => {
+                // Insert H1 at beginning
+                doc.blocks.insert(
+                    0,
+                    Block::Heading {
+                        level: 1,
+                        content: vec![Inline::Text(expected.clone())],
+                    },
+                );
+            }
+            Self::H1Mismatch { expected } => {
+                // Find and update H1
+                if let Some(idx) = doc
+                    .blocks
+                    .iter()
+                    .position(|b| matches!(b, Block::Heading { level: 1, .. }))
+                {
+                    doc.blocks[idx] = Block::Heading {
+                        level: 1,
+                        content: vec![Inline::Text(expected.clone())],
+                    };
+                }
+            }
+            Self::MissingMonthH1 { month_name } => {
+                // Insert month H1 at beginning
+                doc.blocks.insert(
+                    0,
+                    Block::Heading {
+                        level: 1,
+                        content: vec![Inline::Text(month_name.clone())],
+                    },
+                );
+            }
+            Self::LegacyH3Heading { date_text } => {
+                // Find H3 with this text and convert to H2
+                for block in &mut doc.blocks {
+                    if let Block::Heading { level: 3, content } = block {
+                        if inlines_to_string(content) == *date_text {
+                            *block = Block::Heading {
+                                level: 2,
+                                content: content.clone(),
+                            };
+                        }
+                    }
+                }
+            }
+            Self::EntriesOutOfOrder {
+                preamble,
+                sorted_entries,
+            } => {
+                // Rebuild document with sorted entries
+                doc.blocks = preamble.clone();
+                for (_, _, blocks) in sorted_entries {
+                    doc.blocks.extend(blocks.clone());
+                }
+            }
+            Self::RelatedDocsNeedsUpdate {
+                section_start,
+                section_end,
+                template_blocks,
+                custom_content,
+            } => {
+                let mut new_section = template_blocks.clone();
+                if !custom_content.is_empty() {
+                    new_section.push(Block::BlankLine);
+                    new_section.extend(custom_content.clone());
+                }
+
+                match section_start {
+                    Some(idx) => {
+                        let _ = doc.blocks.splice(*idx..*section_end, new_section);
+                    }
+                    None => {
+                        // Append at end
+                        if !doc.blocks.is_empty()
+                            && !matches!(doc.blocks.last(), Some(Block::BlankLine))
+                        {
+                            doc.blocks.push(Block::BlankLine);
+                        }
+                        doc.blocks.extend(new_section);
+                    }
+                }
+            }
+            Self::NonGoalsNeedsIntro { insert_idx } => {
+                let intro = Block::Paragraph(vec![Inline::Text(
+                    "Explicitly out of scope to keep the project focused:".to_string(),
+                )]);
+                doc.blocks.insert(*insert_idx, intro);
+            }
+            Self::DateNeedsNormalization { field, normalized } => {
+                if let Some(ref mut fm) = doc.frontmatter {
+                    let _ = fm
+                        .extra
+                        .insert(field.clone(), serde_yaml::Value::String(normalized.clone()));
+                }
+            }
+            Self::EmptyOptionalSection { section_indices } => {
+                // Remove in reverse order to preserve indices
+                for &idx in section_indices.iter().rev() {
+                    if idx < doc.blocks.len() {
+                        let _ = doc.blocks.remove(idx);
+                    }
+                }
+            }
+            // Unfixable errors - no-op
+            _ => {}
+        }
+    }
 }
 
 /// Result of formatting markdown files.
@@ -167,6 +486,11 @@ impl FileType {
     /// If `project_root` is provided, also checks for schema-driven types.
     /// Hardcoded types (README, CLAUDE, ROADMAP, Journal) always take precedence.
     pub fn detect(path: &Path, project_root: Option<&Path>) -> Option<Self> {
+        // Only process .md files
+        if path.extension() != Some(OsStr::new("md")) {
+            return None;
+        }
+
         let filename = path.file_name()?;
 
         // Hardcoded types always win
@@ -179,21 +503,21 @@ impl FileType {
         if filename == OsStr::new("ROADMAP.md") {
             return Some(FileType::Roadmap);
         }
-        // Journal: parent is "journal/" and file is .md
-        if path.parent().and_then(|p| p.file_name()) == Some(OsStr::new(JOURNAL_DIR))
-            && path.extension() == Some(OsStr::new("md"))
-        {
+        // Journal: parent is "journal/"
+        if path.parent().and_then(|p| p.file_name()) == Some(OsStr::new(JOURNAL_DIR)) {
             return Some(FileType::Journal);
         }
-        // Claude command: grandparent is ".claude" and parent is "commands" and file is .md
+        // Claude/opencode command: .claude/commands/*.md or .opencode/command/*.md
         if let Some(parent) = path.parent() {
-            if parent.file_name() == Some(OsStr::new("commands")) {
-                if let Some(grandparent) = parent.parent() {
-                    if grandparent.file_name() == Some(OsStr::new(".claude"))
-                        && path.extension() == Some(OsStr::new("md"))
-                    {
-                        return Some(FileType::ClaudeCommand);
-                    }
+            if let Some(grandparent) = parent.parent() {
+                let parent_name = parent.file_name();
+                let gp_name = grandparent.file_name();
+                let is_claude_cmd = gp_name == Some(OsStr::new(".claude"))
+                    && parent_name == Some(OsStr::new("commands"));
+                let is_opencode_cmd = gp_name == Some(OsStr::new(".opencode"))
+                    && parent_name == Some(OsStr::new("command"));
+                if is_claude_cmd || is_opencode_cmd {
+                    return Some(FileType::ClaudeCommand);
                 }
             }
         }
@@ -232,19 +556,12 @@ impl FileType {
             FileType::Custom { schema, type_name } => custom::validate(doc, ctx, schema, type_name),
         }
     }
+}
 
-    /// Normalize the document in place.
-    pub fn normalize(&self, doc: &mut Document, ctx: &FormatContext) {
-        match self {
-            FileType::Readme => readme::normalize(doc, ctx),
-            FileType::Claude => claude::normalize(doc, ctx),
-            FileType::ClaudeCommand => command::normalize(doc, ctx),
-            FileType::Journal => journal::normalize(doc, ctx),
-            FileType::Roadmap => roadmap::normalize(doc, ctx),
-            FileType::Custom { schema, type_name } => {
-                custom::normalize(doc, ctx, schema, type_name);
-            }
-        }
+/// Apply all fixable errors to a document.
+pub fn apply_fixes(doc: &mut Document, errors: &[ValidationError]) {
+    for error in errors {
+        error.fix(doc);
     }
 }
 
@@ -310,20 +627,27 @@ pub fn inlines_to_markdown(inlines: &[Inline]) -> String {
 
 /// Validate that a slice of blocks contains only bullet lists (no paragraphs or code blocks).
 /// Returns an error for each non-list block found.
-pub fn validate_bullets_only(blocks: &[Block], context: &str) -> Vec<ValidationError> {
+///
+/// `block_lines` provides 1-based line numbers parallel to `blocks` (may be empty).
+pub fn validate_bullets_only(
+    blocks: &[Block],
+    block_lines: &[usize],
+    context: &str,
+) -> Vec<ValidationError> {
     let mut errors = Vec::new();
-    for block in blocks {
+    for (i, block) in blocks.iter().enumerate() {
+        let line = block_lines.get(i).copied().unwrap_or(0);
         match block {
             Block::List { .. } | Block::BlankLine | Block::Heading { .. } => {}
             Block::Paragraph(_) => {
-                errors.push(ValidationError {
-                    line: 0,
+                errors.push(ValidationError::SectionError {
+                    line,
                     message: format!("{context} expects bullet list, found paragraph"),
                 });
             }
             Block::CodeBlock { .. } => {
-                errors.push(ValidationError {
-                    line: 0,
+                errors.push(ValidationError::SectionError {
+                    line,
                     message: format!("{context} expects bullet list, found code block"),
                 });
             }
@@ -336,37 +660,51 @@ pub fn validate_bullets_only(blocks: &[Block], context: &str) -> Vec<ValidationE
 pub fn validate_links(doc: &Document, ctx: &FormatContext) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
-    fn check_inlines(inlines: &[Inline], ctx: &FormatContext, errors: &mut Vec<ValidationError>) {
+    fn check_inlines(
+        inlines: &[Inline],
+        line: usize,
+        ctx: &FormatContext,
+        errors: &mut Vec<ValidationError>,
+    ) {
         for inline in inlines {
             match inline {
                 Inline::Link { url, .. } if url.is_empty() => {
-                    errors.push(ValidationError {
-                        line: 0,
-                        message: "link has empty URL".to_string(),
+                    errors.push(ValidationError::BrokenLink {
+                        line,
+                        target: String::new(),
+                        reason: "link has empty URL".to_string(),
                     });
                 }
                 Inline::Link { url, .. } => {
-                    if let Some(err) = validate_link_exists(url, ctx) {
+                    if let Some(err) = validate_link_exists(url, line, ctx) {
                         errors.push(err);
                     }
                 }
                 Inline::Strong(inner) | Inline::Emphasis(inner) => {
-                    check_inlines(inner, ctx, errors);
+                    check_inlines(inner, line, ctx, errors);
                 }
                 _ => {}
             }
         }
     }
 
-    fn check_blocks(blocks: &[Block], ctx: &FormatContext, errors: &mut Vec<ValidationError>) {
-        for block in blocks {
+    fn check_blocks(
+        blocks: &[Block],
+        block_lines: &[usize],
+        ctx: &FormatContext,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        for (i, block) in blocks.iter().enumerate() {
+            let line = block_lines.get(i).copied().unwrap_or(0);
             match block {
-                Block::Heading { content, .. } => check_inlines(content, ctx, errors),
-                Block::Paragraph(content) => check_inlines(content, ctx, errors),
+                Block::Heading { content, .. } => check_inlines(content, line, ctx, errors),
+                Block::Paragraph(content) => check_inlines(content, line, ctx, errors),
                 Block::List { items, .. } => {
                     for item in items {
-                        check_inlines(&item.content, ctx, errors);
-                        check_blocks(&item.children, ctx, errors);
+                        check_inlines(&item.content, line, ctx, errors);
+                        // Nested blocks inherit the parent list block's line
+                        let child_lines = vec![line; item.children.len()];
+                        check_blocks(&item.children, &child_lines, ctx, errors);
                     }
                 }
                 Block::CodeBlock { .. } | Block::BlankLine => {}
@@ -374,13 +712,17 @@ pub fn validate_links(doc: &Document, ctx: &FormatContext) -> Vec<ValidationErro
         }
     }
 
-    check_blocks(&doc.blocks, ctx, &mut errors);
+    check_blocks(&doc.blocks, &doc.block_lines, ctx, &mut errors);
 
     errors
 }
 
 /// Check if a local link target exists.
-pub fn validate_link_exists(link: &str, ctx: &FormatContext) -> Option<ValidationError> {
+pub fn validate_link_exists(
+    link: &str,
+    line: usize,
+    ctx: &FormatContext,
+) -> Option<ValidationError> {
     // Skip external URLs
     if link.starts_with("http://") || link.starts_with("https://") {
         return None;
@@ -393,9 +735,10 @@ pub fn validate_link_exists(link: &str, ctx: &FormatContext) -> Option<Validatio
 
     // Check that relative links are properly URL-encoded (no literal spaces)
     if link.contains(' ') {
-        return Some(ValidationError {
-            line: 0,
-            message: format!("link contains unencoded space: {link}"),
+        return Some(ValidationError::BrokenLink {
+            line,
+            target: link.to_string(),
+            reason: "link contains unencoded space".to_string(),
         });
     }
 
@@ -421,11 +764,11 @@ pub fn validate_link_exists(link: &str, ctx: &FormatContext) -> Option<Validatio
                     .iter()
                     .any(|p| p.starts_with(&format!("{}/", relative_str)));
             if !is_valid && !resolved.exists() {
-                return Some(ValidationError {
-                    line: 0,
-                    message: format!(
-                        "link target not found: {} (checked git ls-tree HEAD:{} and stat {})",
-                        link,
+                return Some(ValidationError::BrokenLink {
+                    line,
+                    target: link.to_string(),
+                    reason: format!(
+                        "not found (checked git ls-tree HEAD:{} and stat {})",
                         relative_str,
                         resolved.display()
                     ),
@@ -433,15 +776,17 @@ pub fn validate_link_exists(link: &str, ctx: &FormatContext) -> Option<Validatio
             }
         } else {
             // Path is outside repo, can't validate via git
-            return Some(ValidationError {
-                line: 0,
-                message: format!("link target outside repository: {}", link),
+            return Some(ValidationError::BrokenLink {
+                line,
+                target: link.to_string(),
+                reason: "target outside repository".to_string(),
             });
         }
     } else if !resolved.exists() {
-        return Some(ValidationError {
-            line: 0,
-            message: format!("link target not found: {}", link),
+        return Some(ValidationError::BrokenLink {
+            line,
+            target: link.to_string(),
+            reason: "target not found".to_string(),
         });
     }
 
@@ -499,6 +844,90 @@ pub fn urlencoding_decode(s: &str) -> String {
     result
 }
 
+/// Detect link-like patterns that failed to parse due to whitespace in URL.
+///
+/// CommonMark parsers don't recognize `[text](url with space)` as a link,
+/// so we scan the raw text to catch these malformed patterns.
+///
+/// Accepts full markdown content including frontmatter.
+pub fn detect_malformed_links(content: &str) -> Vec<ValidationError> {
+    use regex::Regex;
+
+    let mut errors = Vec::new();
+
+    // Pattern: [text](url containing space or tab)
+    // This matches link-like syntax that would fail to parse due to whitespace
+    let Ok(re) = Regex::new(r"\[([^\]]+)\]\(([^)]*[ \t][^)]*)\)") else {
+        return errors;
+    };
+
+    // Track state
+    let mut in_frontmatter = false;
+    let mut seen_frontmatter_start = false;
+    let mut in_fenced_code = false;
+    let mut current_line = 1; // 1-based
+
+    for line in content.lines() {
+        // Handle frontmatter (YAML between --- markers)
+        if line == "---" {
+            if !seen_frontmatter_start && current_line == 1 {
+                in_frontmatter = true;
+                seen_frontmatter_start = true;
+                current_line += 1;
+                continue;
+            } else if in_frontmatter {
+                in_frontmatter = false;
+                current_line += 1;
+                continue;
+            }
+        }
+
+        // Skip frontmatter content
+        if in_frontmatter {
+            current_line += 1;
+            continue;
+        }
+
+        // Check for fenced code block markers
+        if line.trim_start().starts_with("```") {
+            in_fenced_code = !in_fenced_code;
+            current_line += 1;
+            continue;
+        }
+
+        // Skip content inside fenced code blocks
+        if in_fenced_code {
+            current_line += 1;
+            continue;
+        }
+
+        // Check for malformed links on this line
+        for cap in re.captures_iter(line) {
+            if let Some(url_match) = cap.get(2) {
+                let url = url_match.as_str();
+                // Skip if this looks like it's inside inline code
+                // Simple heuristic: check if there's a backtick before the match
+                let prefix = &line[..cap.get(0).map(|m| m.start()).unwrap_or(0)];
+                let backtick_count = prefix.chars().filter(|&c| c == '`').count();
+                if backtick_count % 2 == 1 {
+                    // Odd number of backticks = we're inside inline code
+                    continue;
+                }
+
+                errors.push(ValidationError::BrokenLink {
+                    line: current_line,
+                    target: url.to_string(),
+                    reason: "link contains unencoded space (use %20 instead)".to_string(),
+                });
+            }
+        }
+
+        current_line += 1;
+    }
+
+    errors
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,12 +950,9 @@ mod tests {
             git_tree: None,
             repo_root: None,
         };
-        let err = validate_link_exists("file with spaces.md", &ctx);
+        let err = validate_link_exists("file with spaces.md", 1, &ctx);
         assert!(err.is_some());
-        assert!(err
-            .unwrap()
-            .message
-            .contains("link contains unencoded space"));
+        assert!(err.unwrap().message().contains("unencoded space"));
     }
 
     #[test]
@@ -540,7 +966,46 @@ mod tests {
         };
         // Encoded space should not trigger the unencoded space error
         // (it will fail on "target not found" instead)
-        let err = validate_link_exists("file%20with%20spaces.md", &ctx);
-        assert!(err.is_none() || !err.unwrap().message.contains("unencoded space"));
+        let err = validate_link_exists("file%20with%20spaces.md", 1, &ctx);
+        assert!(err.is_none() || !err.unwrap().message().contains("unencoded space"));
+    }
+
+    #[test]
+    fn test_detect_malformed_link_with_space() {
+        let content = "# Title\n\nSee [my link](file with space.md) here.";
+        let errors = detect_malformed_links(content);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message().contains("unencoded space"));
+        assert_eq!(errors[0].line(), 3);
+    }
+
+    #[test]
+    fn test_detect_malformed_link_skips_code_block() {
+        let content = "# Title\n\n```\n[not a link](has spaces.md)\n```\n\nText.";
+        let errors = detect_malformed_links(content);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_detect_malformed_link_skips_inline_code() {
+        let content = "# Title\n\nSee `[not a link](has spaces.md)` here.";
+        let errors = detect_malformed_links(content);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_detect_malformed_link_valid_link_ignored() {
+        let content = "# Title\n\nSee [my link](valid-file.md) here.";
+        let errors = detect_malformed_links(content);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_detect_malformed_link_skips_frontmatter() {
+        let content =
+            "---\ncreated: 2024-01-01\n---\n# Title\n\nSee [my link](file with space.md) here.";
+        let errors = detect_malformed_links(content);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line(), 6); // After 3 lines of frontmatter + blank + title
     }
 }

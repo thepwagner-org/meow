@@ -5,7 +5,7 @@
 
 use super::{
     inlines_to_string, is_encrypted, parse, serialize, validate_links, Block, Document,
-    FormatContext, Inline, ValidationError,
+    FormatContext, ValidationError,
 };
 use crate::{JOURNAL_DIR, PROJECTS_DIR};
 use anyhow::{Context, Result};
@@ -15,10 +15,22 @@ use std::fs;
 use std::path::Path;
 
 /// Validate a journal document.
+///
+/// Returns both unfixable errors and fixable issues (which will be auto-fixed).
 pub fn validate(doc: &Document, ctx: &FormatContext) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
     let year_month = ctx.year_month.as_deref().unwrap_or("unknown");
+
+    // Check for legacy H3 date headings that need migration
+    for block in &doc.blocks {
+        if let Block::Heading { level: 3, content } = block {
+            let text = inlines_to_string(content);
+            if parse_journal_heading(&text).is_some() {
+                errors.push(ValidationError::LegacyH3Heading { date_text: text });
+            }
+        }
+    }
 
     // Check H1 is a month name
     let has_valid_h1 = doc
@@ -27,32 +39,27 @@ pub fn validate(doc: &Document, ctx: &FormatContext) -> Vec<ValidationError> {
         .any(|b| matches!(b, Block::Heading { level: 1, .. }));
 
     if !has_valid_h1 {
-        errors.push(ValidationError {
-            line: 1,
-            message: "journal must have a month heading (# Month Year)".to_string(),
-        });
+        let month_name = generate_month_name(year_month);
+        errors.push(ValidationError::MissingMonthH1 { month_name });
     }
 
     // Check H2s are valid dates (with optional time)
-    for block in &doc.blocks {
+    for (i, block) in doc.blocks.iter().enumerate() {
+        let line = doc.block_lines.get(i).copied().unwrap_or(0);
         if let Block::Heading { level: 2, content } = block {
             let text = inlines_to_string(content);
             if let Some((date, _time)) = parse_journal_heading(&text) {
                 // Check date matches year_month
                 let date_str = date.format("%Y-%m-%d").to_string();
                 if !date_str.starts_with(year_month) {
-                    errors.push(ValidationError {
-                        line: 0,
-                        message: format!("date {text} doesn't match file {year_month}"),
+                    errors.push(ValidationError::DateFileMismatch {
+                        line,
+                        date: text,
+                        expected_prefix: year_month.to_string(),
                     });
                 }
             } else {
-                errors.push(ValidationError {
-                    line: 0,
-                    message: format!(
-                        "invalid date format: {text:?} (expected YYYY-MM-DD or YYYY-MM-DD HH:MM)"
-                    ),
-                });
+                errors.push(ValidationError::InvalidDateFormat { line, text });
             }
         }
 
@@ -60,11 +67,31 @@ pub fn validate(doc: &Document, ctx: &FormatContext) -> Vec<ValidationError> {
         if let Block::Paragraph(content) = block {
             let text = inlines_to_string(content);
             if text.starts_with("##") && !text.starts_with("## ") {
-                errors.push(ValidationError {
-                    line: 0,
-                    message: format!("malformed heading: {text:?} (missing space after ##)"),
-                });
+                errors.push(ValidationError::MalformedHeading { line, text });
             }
+        }
+    }
+
+    // Check if entries are out of order (and provide sorted version if so)
+    let ParsedJournal { preamble, entries } = parse_journal_blocks(doc.blocks.iter().cloned());
+
+    if !entries.is_empty() {
+        let mut sorted_entries = entries.clone();
+        sorted_entries.sort_by_key(|(date, time, _)| {
+            Reverse((*date, time.unwrap_or_else(default_sort_time)))
+        });
+
+        // Check if order changed
+        let is_sorted = entries
+            .iter()
+            .zip(sorted_entries.iter())
+            .all(|(a, b)| a.0 == b.0 && a.1 == b.1);
+
+        if !is_sorted {
+            errors.push(ValidationError::EntriesOutOfOrder {
+                preamble,
+                sorted_entries,
+            });
         }
     }
 
@@ -72,55 +99,6 @@ pub fn validate(doc: &Document, ctx: &FormatContext) -> Vec<ValidationError> {
     errors.extend(validate_links(doc, ctx));
 
     errors
-}
-
-/// Normalize a journal document in place.
-pub fn normalize(doc: &mut Document, ctx: &FormatContext) {
-    let year_month = ctx.year_month.as_deref().unwrap_or("unknown");
-
-    // Migrate legacy H3 date headings to H2
-    for block in &mut doc.blocks {
-        if let Block::Heading { level: 3, content } = block {
-            let text = inlines_to_string(content);
-            if parse_journal_heading(&text).is_some() {
-                *block = Block::Heading {
-                    level: 2,
-                    content: content.clone(),
-                };
-            }
-        }
-    }
-
-    // Ensure H1 month heading exists and is correct
-    let month_name = generate_month_name(year_month);
-    let has_h1 = doc
-        .blocks
-        .iter()
-        .any(|b| matches!(b, Block::Heading { level: 1, .. }));
-
-    if !has_h1 {
-        doc.blocks.insert(
-            0,
-            Block::Heading {
-                level: 1,
-                content: vec![Inline::Text(month_name)],
-            },
-        );
-    }
-
-    // Parse and sort entries
-    let ParsedJournal {
-        preamble,
-        mut entries,
-    } = parse_journal_blocks(doc.blocks.drain(..));
-
-    entries.sort_by_key(|(date, time, _)| Reverse((*date, time.unwrap_or_else(default_sort_time))));
-
-    // Rebuild document
-    doc.blocks = preamble;
-    for (_, _, blocks) in entries {
-        doc.blocks.extend(blocks);
-    }
 }
 
 /// Generate a month name from YYYY-MM format.
@@ -350,6 +328,7 @@ pub fn render_entries(project: &str, entries: &[JournalEntry]) -> String {
                     let mini_doc = Document {
                         frontmatter: None,
                         blocks: vec![block.clone()],
+                        block_lines: vec![],
                     };
                     out.push_str(&serialize(&mini_doc));
                 }
@@ -390,6 +369,7 @@ pub fn render_timeline(project: &str, items: &[TimelineItem]) -> String {
                             let mini_doc = Document {
                                 frontmatter: None,
                                 blocks: vec![block.clone()],
+                                block_lines: vec![],
                             };
                             out.push_str(&serialize(&mini_doc));
                         }
@@ -436,6 +416,13 @@ mod tests {
         }
     }
 
+    /// Apply all fixable errors to a document.
+    fn apply_fixes(doc: &mut Document, errors: &[ValidationError]) {
+        for error in errors {
+            error.fix(doc);
+        }
+    }
+
     #[test]
     fn test_parse_and_format_journal() {
         let content = r#"# November 2025
@@ -447,7 +434,8 @@ mod tests {
 - Later entry
 "#;
         let mut doc = parse(content);
-        normalize(&mut doc, &make_ctx("2025-11"));
+        let errors = validate(&doc, &make_ctx("2025-11"));
+        apply_fixes(&mut doc, &errors);
         let formatted = serialize(&doc);
 
         // 2025-11-29 should come before 2025-11-28 (newest first)
@@ -468,7 +456,8 @@ mod tests {
 - Later entry
 "#;
         let mut doc = parse(content);
-        normalize(&mut doc, &make_ctx("2025-11"));
+        let errors = validate(&doc, &make_ctx("2025-11"));
+        apply_fixes(&mut doc, &errors);
         let formatted = serialize(&doc);
 
         // Should have H2 headings after migration
@@ -491,7 +480,9 @@ mod tests {
 "#;
         let doc = parse(content);
         let errors = validate(&doc, &make_ctx("2025-11"));
-        assert!(errors.iter().any(|e| e.message.contains("invalid date")));
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::InvalidDateFormat { .. })));
     }
 
     #[test]
@@ -510,7 +501,7 @@ Bad entry.
         assert!(
             errors
                 .iter()
-                .any(|e| e.message.contains("malformed heading")),
+                .any(|e| matches!(e, ValidationError::MalformedHeading { .. })),
             "should detect malformed heading: {errors:?}"
         );
     }
@@ -563,7 +554,8 @@ Bad entry.
 - Entry without time (sorts last for the day)
 "#;
         let mut doc = parse(content);
-        normalize(&mut doc, &make_ctx("2025-11"));
+        let errors = validate(&doc, &make_ctx("2025-11"));
+        apply_fixes(&mut doc, &errors);
         let formatted = serialize(&doc);
 
         // Entry without time (23:59) should come first, then 14:30, then 09:00
@@ -586,7 +578,11 @@ Bad entry.
 "#;
         let doc = parse(content);
         let errors = validate(&doc, &make_ctx("2025-11"));
-        assert!(errors.is_empty(), "timestamps should be valid: {errors:?}");
+        // Should only have fixable issues, no unfixable errors
+        assert!(
+            errors.iter().all(|e| e.is_fixable()),
+            "timestamps should be valid: {errors:?}"
+        );
     }
 
     #[test]

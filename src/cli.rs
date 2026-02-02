@@ -103,6 +103,9 @@ pub enum Command {
         #[command(subcommand)]
         command: MirrorCommand,
     },
+
+    /// Start Language Server Protocol server (diagnostics for markdown files)
+    Lsp,
 }
 
 #[derive(Subcommand, Debug)]

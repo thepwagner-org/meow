@@ -220,7 +220,7 @@ pub fn cmd_init(shell: &str) -> Result<String> {
         r#"function meow
   set -l __meow_bin "{bin}"
   switch $argv[1]
-    case list ls rm drop init fmt journal zellij z prune decrypt pull mirror --help -h --version -V
+    case list ls rm drop init fmt journal zellij z prune decrypt pull mirror lsp --help -h --version -V
       $__meow_bin $argv
     case add cd
       set -l result ($__meow_bin $argv)
@@ -394,10 +394,10 @@ fn print_format_result(project: &str, result: &markdown::FormatResult, check: bo
 
         for error in &result.errors {
             for e in &error.errors {
-                if e.line > 0 {
-                    println!("  {}:{}: {}", error.path, e.line, e.message);
+                if e.line() > 0 {
+                    println!("  {}:{}: {}", error.path, e.line(), e.message());
                 } else {
-                    println!("  {}: {}", error.path, e.message);
+                    println!("  {}: {}", error.path, e.message());
                 }
             }
         }
@@ -541,7 +541,10 @@ description: TODO Add description
         git_tree: None,
         repo_root: None,
     };
-    claude::normalize(&mut claude_doc, &claude_ctx);
+    let errors = claude::validate(&claude_doc, &claude_ctx);
+    for error in &errors {
+        error.fix(&mut claude_doc);
+    }
     fs::write(&claude_path, serialize(&claude_doc)).context("Failed to create CLAUDE.md")?;
 
     let shell_nix_content = r#"{pkgs, ...}:

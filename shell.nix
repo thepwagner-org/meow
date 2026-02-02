@@ -1,11 +1,13 @@
 {pkgs, ...}:
 pkgs.mkShell {
-  buildInputs = [
-    pkgs.cargo
-    pkgs.rustfmt
-    pkgs.clippy
-    pkgs.pkg-config
-    pkgs.openssl
-    pkgs.git
+  buildInputs = with pkgs; [
+    cargo
+    rustfmt
+    clippy
+    rust-analyzer
+
+    pkg-config
+    openssl
+    git
   ];
 }

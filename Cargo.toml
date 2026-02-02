@@ -41,11 +41,14 @@ indexmap = { version = "2", features = ["serde"] }
 termimad = "0.30"
 pulldown-cmark = "0.12"
 rand = "0.8"
+regex = "1"
 walkdir = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fuzzy-matcher = "0.3"
 is-terminal = "0.4"
+lsp-server = "0.7"
+lsp-types = "0.97"
 
 [dev-dependencies]
 tempfile = "3"

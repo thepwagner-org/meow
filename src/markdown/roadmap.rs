@@ -3,12 +3,14 @@
 //! ROADMAP.md files document future possibilities and non-goals.
 //! Validates structure and ensures Non-Goals section exists.
 
-use super::{Block, Document, FormatContext, Inline, ValidationError};
+use super::{Block, Document, FormatContext, ValidationError};
 
 /// Expected non-goals intro text.
 const NON_GOALS_INTRO: &str = "Explicitly out of scope";
 
 /// Validate a ROADMAP.md document.
+///
+/// Returns both unfixable errors and fixable issues (which will be auto-fixed).
 pub fn validate(doc: &Document, _ctx: &FormatContext) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
@@ -18,70 +20,54 @@ pub fn validate(doc: &Document, _ctx: &FormatContext) -> Vec<ValidationError> {
         .iter()
         .any(|b| matches!(b, Block::Heading { level: 1, .. }));
     if !has_h1 {
-        errors.push(ValidationError {
-            line: 0,
-            message: "ROADMAP.md should have an H1 title".to_string(),
+        errors.push(ValidationError::MissingH1 {
+            expected: "Roadmap".to_string(),
         });
     }
 
     // Check for Non-Goals section
-    let has_non_goals = doc.blocks.iter().any(|b| {
+    let non_goals_idx = doc.blocks.iter().position(|b| {
         matches!(b, Block::Heading { level: 2, .. })
             && b.heading_text()
                 .map(|t| t.eq_ignore_ascii_case("non-goals"))
                 .unwrap_or(false)
     });
-    if !has_non_goals {
-        errors.push(ValidationError {
-            line: 0,
-            message: "ROADMAP.md should have a '## Non-Goals' section".to_string(),
-        });
+
+    match non_goals_idx {
+        None => {
+            errors.push(ValidationError::MissingSection {
+                section: "Non-Goals".to_string(),
+            });
+        }
+        Some(idx) => {
+            // Check if Non-Goals section has intro paragraph
+            let content_idx = doc.blocks[idx + 1..]
+                .iter()
+                .position(|b| !matches!(b, Block::BlankLine))
+                .map(|i| idx + 1 + i);
+
+            let has_intro = content_idx.is_some_and(|i| {
+                if let Some(Block::Paragraph(inlines)) = doc.blocks.get(i) {
+                    let text = super::inlines_to_string(inlines);
+                    text.starts_with(NON_GOALS_INTRO)
+                } else {
+                    false
+                }
+            });
+
+            if !has_intro {
+                // Calculate insert position
+                let insert_idx = if matches!(doc.blocks.get(idx + 1), Some(Block::BlankLine)) {
+                    idx + 2
+                } else {
+                    idx + 1
+                };
+                errors.push(ValidationError::NonGoalsNeedsIntro { insert_idx });
+            }
+        }
     }
 
     errors
-}
-
-/// Normalize a ROADMAP.md document in place.
-pub fn normalize(doc: &mut Document, _ctx: &FormatContext) {
-    // Find Non-Goals section and ensure it has the standard intro
-    if let Some(idx) = doc.blocks.iter().position(|b| {
-        matches!(b, Block::Heading { level: 2, .. })
-            && b.heading_text()
-                .map(|t| t.eq_ignore_ascii_case("non-goals"))
-                .unwrap_or(false)
-    }) {
-        // Find the first non-blank block after the heading
-        let content_idx = doc.blocks[idx + 1..]
-            .iter()
-            .position(|b| !matches!(b, Block::BlankLine))
-            .map(|i| idx + 1 + i);
-
-        // Check if it's a paragraph starting with the intro
-        let has_intro = content_idx.is_some_and(|i| {
-            if let Some(Block::Paragraph(inlines)) = doc.blocks.get(i) {
-                let text = super::inlines_to_string(inlines);
-                text.starts_with(NON_GOALS_INTRO)
-            } else {
-                false
-            }
-        });
-
-        // If no intro paragraph, insert one after heading (and any blank line)
-        if !has_intro {
-            let insert_idx = if matches!(doc.blocks.get(idx + 1), Some(Block::BlankLine)) {
-                idx + 2
-            } else {
-                idx + 1
-            };
-
-            let intro = Block::Paragraph(vec![Inline::Text(format!(
-                "{} to keep the project focused:",
-                NON_GOALS_INTRO
-            ))]);
-
-            doc.blocks.insert(insert_idx, intro);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -90,6 +76,13 @@ mod tests {
     use crate::markdown::{parse, serialize, FileType};
     use std::path::Path;
     use tempfile::NamedTempFile;
+
+    /// Apply all fixable errors to a document.
+    fn apply_fixes(doc: &mut Document, errors: &[ValidationError]) {
+        for error in errors {
+            error.fix(doc);
+        }
+    }
 
     #[test]
     fn test_matches_roadmap_md() {
@@ -121,7 +114,9 @@ mod tests {
         };
 
         let errors = validate(&doc, &ctx);
-        assert!(errors.iter().any(|e| e.message.contains("H1")));
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::MissingH1 { .. })));
     }
 
     #[test]
@@ -137,12 +132,14 @@ mod tests {
         };
 
         let errors = validate(&doc, &ctx);
-        assert!(errors.iter().any(|e| e.message.contains("Non-Goals")));
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::MissingSection { .. })));
     }
 
     #[test]
     fn test_validate_ok() {
-        let content = "# Roadmap\n\n## Features\n\n## Non-Goals\n\nOut of scope.";
+        let content = "# Roadmap\n\n## Features\n\n## Non-Goals\n\nExplicitly out of scope to keep the project focused:\n\n- Things";
         let doc = parse(content);
         let file = NamedTempFile::new().expect("tempfile");
         let ctx = FormatContext {
@@ -154,10 +151,10 @@ mod tests {
         };
 
         let errors = validate(&doc, &ctx);
-        assert!(errors.is_empty());
+        assert!(errors.is_empty(), "expected no errors: {:?}", errors);
     }
 
-    fn normalize_test(content: &str) -> String {
+    fn fix_test(content: &str) -> String {
         let mut doc = parse(content);
         let file = NamedTempFile::new().expect("tempfile");
         let ctx = FormatContext {
@@ -167,31 +164,32 @@ mod tests {
             git_tree: None,
             repo_root: None,
         };
-        normalize(&mut doc, &ctx);
+        let errors = validate(&doc, &ctx);
+        apply_fixes(&mut doc, &errors);
         serialize(&doc)
     }
 
     #[test]
-    fn test_normalize_adds_intro_to_non_goals() {
+    fn test_fix_adds_intro_to_non_goals() {
         let content = "# Roadmap\n\n## Non-Goals\n\n- **Thing** - Reason";
-        let result = normalize_test(content);
+        let result = fix_test(content);
         assert!(result.contains("Explicitly out of scope"));
     }
 
     #[test]
-    fn test_normalize_preserves_existing_intro() {
+    fn test_fix_preserves_existing_intro() {
         let content =
             "# Roadmap\n\n## Non-Goals\n\nExplicitly out of scope to keep the project focused:\n\n- **Thing** - Reason";
-        let result = normalize_test(content);
+        let result = fix_test(content);
         // Should only have one instance
         assert_eq!(result.matches("Explicitly out of scope").count(), 1);
     }
 
     #[test]
-    fn test_normalize_idempotent() {
+    fn test_fix_idempotent() {
         let content = "# Roadmap\n\n## Non-Goals\n\n- **Thing** - Reason";
-        let first = normalize_test(content);
-        let second = normalize_test(&first);
+        let first = fix_test(content);
+        let second = fix_test(&first);
         assert_eq!(first, second);
     }
 }

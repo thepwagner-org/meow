@@ -18,42 +18,35 @@ const RELATED_DOCS_SECTION: &str = r#"## Related Documents
 "#;
 
 /// Validate a CLAUDE.md document.
-pub fn validate(_doc: &Document, ctx: &FormatContext) -> Vec<ValidationError> {
+///
+/// Returns both unfixable errors and fixable issues (which will be auto-fixed).
+pub fn validate(doc: &Document, ctx: &FormatContext) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
     // Warn if file is large
     if let Ok(content) = std::fs::read_to_string(ctx.path) {
         if content.len() > SIZE_WARNING_THRESHOLD {
-            errors.push(ValidationError {
-                line: 0,
-                message: format!(
-                    "CLAUDE.md is large ({} bytes, threshold: {}). Consider condensing.",
-                    content.len(),
-                    SIZE_WARNING_THRESHOLD
-                ),
+            errors.push(ValidationError::FileTooLarge {
+                line: 1,
+                size: content.len(),
+                threshold: SIZE_WARNING_THRESHOLD,
             });
         }
     }
 
-    errors
-}
-
-/// Normalize a CLAUDE.md document in place.
-pub fn normalize(doc: &mut Document, _ctx: &FormatContext) {
+    // Check if Related Documents section needs updating
     let template_doc = parse(RELATED_DOCS_SECTION);
     let template_blocks: Vec<Block> = template_doc.blocks;
-    // Count non-blank blocks for comparison with existing content
     let template_content_count = template_blocks
         .iter()
         .filter(|b| !matches!(b, Block::BlankLine))
         .count();
 
-    // Find existing Related Documents section (or legacy Journal/Roadmap sections)
     let section_idx = find_related_docs_section(doc);
 
     match section_idx {
         Some((idx, legacy_sections)) => {
-            // Find the end of all related sections (next H2 after last legacy section, or end of doc)
+            // Find the end of all related sections
             let last_section_idx = legacy_sections.last().copied().unwrap_or(idx);
             let section_end = doc.blocks[last_section_idx + 1..]
                 .iter()
@@ -75,24 +68,41 @@ pub fn normalize(doc: &mut Document, _ctx: &FormatContext) {
                 vec![]
             };
 
-            // Build new section: template + blank + custom content
-            let mut new_section = template_blocks;
-            if !custom_content.is_empty() {
-                new_section.push(Block::BlankLine);
-                new_section.extend(custom_content);
-            }
+            // Check if content needs updating (legacy sections or template mismatch)
+            let needs_update = !legacy_sections.is_empty() || {
+                // Compare existing template portion with expected
+                let existing_template_portion: Vec<_> = existing_content
+                    .iter()
+                    .take(template_content_count)
+                    .collect();
+                let expected_template_portion: Vec<_> = template_blocks
+                    .iter()
+                    .filter(|b| !matches!(b, Block::BlankLine))
+                    .collect();
+                existing_template_portion.len() != expected_template_portion.len()
+            };
 
-            // Replace the section(s)
-            let _ = doc.blocks.splice(idx..section_end, new_section);
+            if needs_update {
+                errors.push(ValidationError::RelatedDocsNeedsUpdate {
+                    section_start: Some(idx),
+                    section_end,
+                    template_blocks,
+                    custom_content,
+                });
+            }
         }
         None => {
-            // Append related docs section at the end
-            if !doc.blocks.is_empty() && !matches!(doc.blocks.last(), Some(Block::BlankLine)) {
-                doc.blocks.push(Block::BlankLine);
-            }
-            doc.blocks.extend(template_blocks);
+            // Section doesn't exist at all
+            errors.push(ValidationError::RelatedDocsNeedsUpdate {
+                section_start: None,
+                section_end: doc.blocks.len(),
+                template_blocks,
+                custom_content: vec![],
+            });
         }
     }
+
+    errors
 }
 
 /// Find the Related Documents section, or legacy Journal/Roadmap sections to migrate.
@@ -131,6 +141,13 @@ mod tests {
     use std::path::Path;
     use tempfile::NamedTempFile;
 
+    /// Apply all fixable errors to a document.
+    fn apply_fixes(doc: &mut Document, errors: &[ValidationError]) {
+        for error in errors {
+            error.fix(doc);
+        }
+    }
+
     #[test]
     fn test_matches_claude_md() {
         assert!(matches!(
@@ -164,7 +181,8 @@ mod tests {
         };
 
         let errors = validate(&doc, &ctx);
-        assert!(errors.is_empty());
+        // Should only have fixable issues (Related Documents needs adding)
+        assert!(errors.iter().all(|e| e.is_fixable()));
     }
 
     #[test]
@@ -184,7 +202,9 @@ mod tests {
         };
 
         let errors = validate(&doc, &ctx);
-        assert!(errors.iter().any(|e| e.message.contains("large")));
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::FileTooLarge { .. })));
     }
 
     #[test]
@@ -204,10 +224,11 @@ mod tests {
         };
 
         let errors = validate(&doc, &ctx);
-        assert!(errors.is_empty());
+        // Should only have fixable issues
+        assert!(errors.iter().all(|e| e.is_fixable()));
     }
 
-    fn normalize_test(content: &str) -> String {
+    fn fix_test(content: &str) -> String {
         let mut doc = parse(content);
         let file = NamedTempFile::new().expect("tempfile");
         let ctx = FormatContext {
@@ -217,13 +238,14 @@ mod tests {
             git_tree: None,
             repo_root: None,
         };
-        normalize(&mut doc, &ctx);
+        let errors = validate(&doc, &ctx);
+        apply_fixes(&mut doc, &errors);
         serialize(&doc)
     }
 
     #[test]
-    fn test_normalize_adds_related_docs_to_empty() {
-        let result = normalize_test("");
+    fn test_fix_adds_related_docs_to_empty() {
+        let result = fix_test("");
         assert!(result.contains("## Related Documents"));
         assert!(result.contains("journal/"));
         assert!(result.contains("ROADMAP.md"));
@@ -231,8 +253,8 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_adds_related_docs_to_existing_content() {
-        let result = normalize_test("# meow\n\nSome instructions.");
+    fn test_fix_adds_related_docs_to_existing_content() {
+        let result = fix_test("# meow\n\nSome instructions.");
         assert!(result.contains("# meow"));
         assert!(result.contains("Some instructions"));
         assert!(result.contains("## Related Documents"));
@@ -245,9 +267,9 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_migrates_legacy_journal() {
+    fn test_fix_migrates_legacy_journal() {
         let content = "# meow\n\n## Journal\n\nOld content here.";
-        let result = normalize_test(content);
+        let result = fix_test(content);
         // Should have the new section
         assert!(result.contains("## Related Documents"));
         // Should not have the old Journal heading
@@ -257,9 +279,9 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_migrates_legacy_roadmap() {
+    fn test_fix_migrates_legacy_roadmap() {
         let content = "# meow\n\n## Roadmap\n\nSome roadmap content.";
-        let result = normalize_test(content);
+        let result = fix_test(content);
         // Should have the new section
         assert!(result.contains("## Related Documents"));
         // Should not have the old Roadmap heading
@@ -267,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_preserves_custom_content() {
+    fn test_fix_preserves_custom_content() {
         // Create content with Related Documents section + custom content beyond template
         let content = r#"# meow
 
@@ -281,17 +303,17 @@ mod tests {
 
 This project also has X, Y, Z.
 "#;
-        let result = normalize_test(content);
+        let result = fix_test(content);
         // Should preserve custom content
         assert!(result.contains("Project-specific notes"));
         assert!(result.contains("This project also has"));
     }
 
     #[test]
-    fn test_normalize_idempotent() {
+    fn test_fix_idempotent() {
         let content = "# meow\n\nSome instructions.";
-        let first = normalize_test(content);
-        let second = normalize_test(&first);
+        let first = fix_test(content);
+        let second = fix_test(&first);
         assert_eq!(first, second);
     }
 }

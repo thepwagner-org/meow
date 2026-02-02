@@ -3,8 +3,9 @@
 //! Walks project directories, dispatches to handlers based on filename patterns.
 
 use super::{
-    is_encrypted, parse, parse_encrypted, schema, schema::Schema, serialize, serialize_encrypted,
-    serialize_with_field_order, FileError, FileType, FormatContext, FormatResult, ValidationError,
+    detect_malformed_links, is_encrypted, parse, parse_encrypted, schema, schema::Schema,
+    serialize, serialize_encrypted, serialize_with_field_order, FileError, FileType, FormatContext,
+    FormatResult, ValidationError,
 };
 use crate::PROJECTS_DIR;
 use anyhow::{Context, Result};
@@ -114,12 +115,24 @@ fn format_file(
         (parse(&content), None)
     };
 
-    let errors = file_type.validate(&doc, ctx);
-    if !errors.is_empty() {
+    let mut errors = file_type.validate(&doc, ctx);
+
+    // Detect malformed links that the parser didn't recognize (e.g., spaces in URL)
+    errors.extend(detect_malformed_links(&content));
+
+    // Apply all fixes
+    for error in &errors {
+        error.fix(&mut doc);
+    }
+
+    // Check for unfixable errors - return all errors but don't continue with formatting
+    let has_unfixable = errors.iter().any(|e| !e.is_fixable());
+    if has_unfixable {
         return Ok((false, errors, None));
     }
 
-    file_type.normalize(&mut doc, ctx);
+    // Keep fixable errors to return as warnings
+    let fixable_warnings = errors;
 
     // Track custom doc info for index generation
     let custom_info = match &file_type {
@@ -156,7 +169,7 @@ fn format_file(
         let Some(key_id) = encrypt_config.get_key_id() else {
             return Ok((
                 false,
-                vec![ValidationError {
+                vec![ValidationError::SchemaError {
                     line: 0,
                     message: "encryption required but no key-id configured".to_string(),
                 }],
@@ -180,11 +193,11 @@ fn format_file(
                 if !opts.check {
                     fs::write(path, &formatted).context("Failed to write encrypted markdown")?;
                 }
-                Ok((true, vec![], custom_info))
+                Ok((true, fixable_warnings, custom_info))
             }
             None => {
                 // No change
-                Ok((false, vec![], custom_info))
+                Ok((false, fixable_warnings, custom_info))
             }
         }
     } else {
@@ -199,9 +212,9 @@ fn format_file(
             if !opts.check {
                 fs::write(path, &formatted).context("Failed to write formatted markdown")?;
             }
-            Ok((true, vec![], custom_info))
+            Ok((true, fixable_warnings, custom_info))
         } else {
-            Ok((false, vec![], custom_info))
+            Ok((false, fixable_warnings, custom_info))
         }
     }
 }
@@ -250,7 +263,7 @@ fn collect_schemas(project_dir: &Path, result: &mut FormatResult) -> HashMap<Pat
                 Err(e) => {
                     result.errors.push(FileError {
                         path: path.display().to_string(),
-                        errors: vec![ValidationError {
+                        errors: vec![ValidationError::SchemaError {
                             line: 0,
                             message: format!("invalid schema: {}", e),
                         }],
@@ -327,7 +340,7 @@ pub fn format_project(
             Err(e) => {
                 result.errors.push(FileError {
                     path: path.display().to_string(),
-                    errors: vec![ValidationError {
+                    errors: vec![ValidationError::SchemaError {
                         line: 0,
                         message: e.to_string(),
                     }],
@@ -381,7 +394,7 @@ fn generate_indexes(
                 } else if let Err(e) = fs::write(&full_index_path, &content) {
                     result.errors.push(FileError {
                         path: full_index_path.display().to_string(),
-                        errors: vec![ValidationError {
+                        errors: vec![ValidationError::IoError {
                             line: 0,
                             message: format!("failed to write index: {}", e),
                         }],

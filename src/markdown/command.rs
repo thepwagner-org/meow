@@ -6,27 +6,24 @@
 use super::{Block, Document, FormatContext, ValidationError};
 
 /// Validate a Claude command document.
+///
+/// Returns both unfixable errors and fixable issues (which will be auto-fixed).
 pub fn validate(doc: &Document, _ctx: &FormatContext) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
-    // Check for H1 title
+    // Check for H1 title (unfixable - we don't know what the command should be named)
     let has_h1 = doc
         .blocks
         .iter()
         .any(|b| matches!(b, Block::Heading { level: 1, .. }));
     if !has_h1 {
-        errors.push(ValidationError {
-            line: 0,
+        errors.push(ValidationError::SchemaError {
+            line: 1,
             message: "Claude command should have an H1 title describing the command".to_string(),
         });
     }
 
     errors
-}
-
-/// Normalize a Claude command document in place.
-pub fn normalize(_doc: &mut Document, _ctx: &FormatContext) {
-    // No normalization needed - just re-serialize for consistent formatting
 }
 
 #[cfg(test)]
@@ -59,6 +56,33 @@ mod tests {
     }
 
     #[test]
+    fn test_matches_opencode_command() {
+        // .opencode/command/ (singular)
+        assert!(matches!(
+            FileType::detect(Path::new(".opencode/command/shipit.md"), None),
+            Some(FileType::ClaudeCommand)
+        ));
+        assert!(matches!(
+            FileType::detect(Path::new("/some/path/.opencode/command/test.md"), None),
+            Some(FileType::ClaudeCommand)
+        ));
+        // Not a command file
+        assert!(!matches!(
+            FileType::detect(Path::new(".opencode/settings.json"), None),
+            Some(FileType::ClaudeCommand)
+        ));
+        // Commands must be in .opencode/command/ (not commands plural)
+        assert!(!matches!(
+            FileType::detect(Path::new(".opencode/commands/shipit.md"), None),
+            Some(FileType::ClaudeCommand)
+        ));
+        assert!(!matches!(
+            FileType::detect(Path::new(".opencode/shipit.md"), None),
+            Some(FileType::ClaudeCommand)
+        ));
+    }
+
+    #[test]
     fn test_validate_requires_h1() {
         let doc = parse("Just some content without a heading.");
         let file = NamedTempFile::new().expect("tempfile");
@@ -71,7 +95,7 @@ mod tests {
         };
 
         let errors = validate(&doc, &ctx);
-        assert!(errors.iter().any(|e| e.message.contains("H1 title")));
+        assert!(errors.iter().any(|e| e.message().contains("H1 title")));
     }
 
     #[test]

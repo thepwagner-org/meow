@@ -4,6 +4,7 @@ pub mod commands;
 pub mod config;
 pub mod crypto;
 pub mod git;
+pub mod lsp;
 pub mod markdown;
 pub mod mirror;
 pub mod picker;
