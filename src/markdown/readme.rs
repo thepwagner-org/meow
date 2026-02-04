@@ -21,7 +21,7 @@ pub fn validate(doc: &Document, ctx: &FormatContext) -> Vec<ValidationError> {
     // Check frontmatter exists
     match &doc.frontmatter {
         None => {
-            errors.push(ValidationError::MissingFrontmatter);
+            errors.push(ValidationError::MissingFrontmatter { reason: None });
         }
         Some(fm) => {
             if fm.created.is_none() {
@@ -128,7 +128,7 @@ Some content here.
         let fm = doc.frontmatter.as_ref().expect("frontmatter");
         assert_eq!(
             fm.created,
-            Some(NaiveDate::from_ymd_opt(2024, 3, 15).expect("date"))
+            Some(NaiveDate::from_ymd_opt(2024, 3, 15).expect("valid date"))
         );
         assert_eq!(fm.description.as_deref(), Some("A test project"));
     }
@@ -139,7 +139,7 @@ Some content here.
         let errors = validate(&doc, &make_ctx());
         assert!(errors
             .iter()
-            .any(|e| matches!(e, ValidationError::MissingFrontmatter)));
+            .any(|e| matches!(e, ValidationError::MissingFrontmatter { .. })));
     }
 
     #[test]

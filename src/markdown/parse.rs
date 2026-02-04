@@ -228,6 +228,18 @@ pub fn is_encrypted(content: &str) -> bool {
     frontmatter.is_some_and(|fm| fm.encrypted)
 }
 
+/// Get the frontmatter parse error from raw content, if any.
+///
+/// Returns `Some(error_message)` if frontmatter exists but failed to deserialize,
+/// `None` if frontmatter parsed successfully or doesn't exist.
+pub fn get_frontmatter_error(content: &str) -> Option<String> {
+    let matter = Matter::<YAML>::new();
+    let parsed = matter.parse(content);
+    parsed
+        .data
+        .and_then(|d| d.deserialize::<Frontmatter>().err().map(|e| e.to_string()))
+}
+
 /// Parse pulldown-cmark events into blocks.
 fn parse_blocks(mut events: VecDeque<Event>) -> Vec<Block> {
     let mut blocks = Vec::new();

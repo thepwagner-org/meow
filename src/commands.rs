@@ -532,20 +532,20 @@ description: TODO Add description
     fs::write(project_dir.join("README.md"), readme_content)
         .context("Failed to create README.md")?;
 
-    let claude_path = project_dir.join("CLAUDE.md");
-    let mut claude_doc = parse("");
-    let claude_ctx = FormatContext {
+    let agents_path = project_dir.join("AGENTS.md");
+    let mut agents_doc = parse("");
+    let agents_ctx = FormatContext {
         project,
-        path: &claude_path,
+        path: &agents_path,
         year_month: None,
         git_tree: None,
         repo_root: None,
     };
-    let errors = claude::validate(&claude_doc, &claude_ctx);
+    let errors = claude::validate(&agents_doc, &agents_ctx, "AGENTS.md");
     for error in &errors {
-        error.fix(&mut claude_doc);
+        error.fix(&mut agents_doc);
     }
-    fs::write(&claude_path, serialize(&claude_doc)).context("Failed to create CLAUDE.md")?;
+    fs::write(&agents_path, serialize(&agents_doc)).context("Failed to create AGENTS.md")?;
 
     let shell_nix_content = r#"{pkgs, ...}:
 pkgs.mkShell {

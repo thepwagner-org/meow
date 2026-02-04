@@ -117,7 +117,20 @@ fn format_file(
 
     let mut errors = file_type.validate(&doc, ctx);
 
-    // Detect malformed links that the parser didn't recognize (e.g., spaces in URL)
+    // Enrich MissingFrontmatter errors with actual parse error reason
+    if doc.frontmatter.is_none() {
+        if let Some(parse_error) = super::get_frontmatter_error(&content) {
+            for err in &mut errors {
+                if matches!(err, ValidationError::MissingFrontmatter { reason: None }) {
+                    *err = ValidationError::MissingFrontmatter {
+                        reason: Some(parse_error.clone()),
+                    };
+                }
+            }
+        }
+    }
+
+    // Detect malformed links that the parser didn't recognized (e.g., spaces in URL)
     errors.extend(detect_malformed_links(&content));
 
     // Apply all fixes
@@ -224,6 +237,7 @@ fn determine_should_encrypt(file_type: &FileType, config: &ProjectEncryptConfig)
     match file_type {
         FileType::Journal => config.should_encrypt("journal"),
         FileType::Readme => config.should_encrypt("readme"),
+        FileType::Agents => config.should_encrypt("agents"),
         FileType::Claude => config.should_encrypt("claude"),
         FileType::Roadmap => config.should_encrypt("roadmap"),
         FileType::ClaudeCommand => false, // Never encrypt claude commands
@@ -231,6 +245,7 @@ fn determine_should_encrypt(file_type: &FileType, config: &ProjectEncryptConfig)
             // Check schema TypeDef for encrypted flag
             schema.get_type(type_name).is_some_and(|td| td.encrypted)
         }
+        FileType::UnknownSchemaType { .. } => false, // Can't encrypt files with invalid types
     }
 }
 

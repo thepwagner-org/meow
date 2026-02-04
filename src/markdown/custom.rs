@@ -38,7 +38,7 @@ pub fn validate(
     };
 
     let Some(ref fm) = doc.frontmatter else {
-        errors.push(ValidationError::MissingFrontmatter);
+        errors.push(ValidationError::MissingFrontmatter { reason: None });
         return errors;
     };
 
@@ -63,6 +63,41 @@ pub fn validate(
     validate_fields(fm, type_def, &mut errors);
     validate_frontmatter_links(fm, type_def, ctx, &mut errors);
     validate_structure(doc, ctx, schema, type_name, type_def, &mut errors);
+    errors
+}
+
+/// Validate a document that is in a schema-covered directory but has no valid type.
+///
+/// This reports specific errors about what's wrong: missing frontmatter,
+/// missing type field, or unknown type value.
+pub fn validate_unknown_type(doc: &Document, schema: &Schema) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    let Some(ref fm) = doc.frontmatter else {
+        errors.push(ValidationError::MissingFrontmatter { reason: None });
+        return errors;
+    };
+
+    let Some(ref doc_type) = fm.doc_type else {
+        let valid_types: Vec<&str> = schema.types.keys().map(|s| s.as_str()).collect();
+        errors.push(ValidationError::MissingRequiredField {
+            line: 1,
+            field: format!("type (valid types: {})", valid_types.join(", ")),
+        });
+        return errors;
+    };
+
+    // Type field exists but isn't recognized
+    let valid_types: Vec<&str> = schema.types.keys().map(|s| s.as_str()).collect();
+    errors.push(ValidationError::SchemaError {
+        line: 1,
+        message: format!(
+            "unknown type '{}' (valid types: {})",
+            doc_type,
+            valid_types.join(", ")
+        ),
+    });
+
     errors
 }
 

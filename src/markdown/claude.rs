@@ -1,26 +1,32 @@
-//! CLAUDE.md file validation and formatting.
+//! Agent instruction file validation and formatting (AGENTS.md, CLAUDE.md).
 //!
-//! CLAUDE.md files provide instructions to Claude Code. No frontmatter required,
+//! These files provide instructions to AI coding agents. No frontmatter required,
 //! but warns if the file is too large (soft limit).
+//!
+//! AGENTS.md is the canonical format (for opencode and other agents).
+//! CLAUDE.md is supported as a fallback for Claude Code.
 
 use super::{parse, Block, Document, FormatContext, ValidationError};
 
-/// Soft limit for CLAUDE.md file size (in bytes).
+/// Soft limit for agent instruction file size (in bytes).
 const SIZE_WARNING_THRESHOLD: usize = 4000;
 
-/// Canonical related documents section injected into CLAUDE.md files.
-const RELATED_DOCS_SECTION: &str = r#"## Related Documents
+/// Template for related documents section. `{AGENT_FILE}` is replaced with the actual filename.
+const RELATED_DOCS_TEMPLATE: &str = r#"## Related Documents
 
 - **journal/** - Daily notes in `YYYY-MM.md` files. Log design discussions, investigations, and decisions with `## YYYY-MM-DD` headings.
 - **ROADMAP.md** - Future possibilities and explicit non-goals. Update when brainstorming; don't track completed work here.
-- **CLAUDE.md** - How to work on the project: architecture, commands, lints. Keep concise.
+- **{AGENT_FILE}** - How to work on the project: architecture, commands, lints. Keep concise.
 - **../knowledge/** - Personal knowledge base. Read `CLAUDE.md` there for structure; schemas in `.meow.d/`.
 "#;
 
-/// Validate a CLAUDE.md document.
+/// Validate an agent instruction file (AGENTS.md or CLAUDE.md).
+///
+/// The `agent_file` parameter specifies which filename to use in the Related Documents
+/// template (e.g., "AGENTS.md" or "CLAUDE.md").
 ///
 /// Returns both unfixable errors and fixable issues (which will be auto-fixed).
-pub fn validate(doc: &Document, ctx: &FormatContext) -> Vec<ValidationError> {
+pub fn validate(doc: &Document, ctx: &FormatContext, agent_file: &str) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
     // Warn if file is large
@@ -35,7 +41,8 @@ pub fn validate(doc: &Document, ctx: &FormatContext) -> Vec<ValidationError> {
     }
 
     // Check if Related Documents section needs updating
-    let template_doc = parse(RELATED_DOCS_SECTION);
+    let related_docs_section = RELATED_DOCS_TEMPLATE.replace("{AGENT_FILE}", agent_file);
+    let template_doc = parse(&related_docs_section);
     let template_blocks: Vec<Block> = template_doc.blocks;
     let template_content_count = template_blocks
         .iter()
@@ -166,6 +173,27 @@ mod tests {
     }
 
     #[test]
+    fn test_matches_agents_md() {
+        assert!(matches!(
+            FileType::detect(Path::new("AGENTS.md"), None),
+            Some(FileType::Agents)
+        ));
+        assert!(matches!(
+            FileType::detect(Path::new("/some/path/AGENTS.md"), None),
+            Some(FileType::Agents)
+        ));
+        assert!(FileType::detect(Path::new("agents.md"), None).is_none()); // case sensitive
+    }
+
+    #[test]
+    fn test_agents_md_template_uses_agents() {
+        let result = fix_test_with_file("", "AGENTS.md");
+        assert!(result.contains("## Related Documents"));
+        // Should have AGENTS.md as the agent file entry
+        assert!(result.contains("- **AGENTS.md** - How to work on the project"));
+    }
+
+    #[test]
     fn test_validate_no_heading_ok() {
         let doc = parse("Just some content without a heading.");
 
@@ -180,7 +208,7 @@ mod tests {
             repo_root: None,
         };
 
-        let errors = validate(&doc, &ctx);
+        let errors = validate(&doc, &ctx, "CLAUDE.md");
         // Should only have fixable issues (Related Documents needs adding)
         assert!(errors.iter().all(|e| e.is_fixable()));
     }
@@ -201,7 +229,7 @@ mod tests {
             repo_root: None,
         };
 
-        let errors = validate(&doc, &ctx);
+        let errors = validate(&doc, &ctx, "CLAUDE.md");
         assert!(errors
             .iter()
             .any(|e| matches!(e, ValidationError::FileTooLarge { .. })));
@@ -223,12 +251,16 @@ mod tests {
             repo_root: None,
         };
 
-        let errors = validate(&doc, &ctx);
+        let errors = validate(&doc, &ctx, "CLAUDE.md");
         // Should only have fixable issues
         assert!(errors.iter().all(|e| e.is_fixable()));
     }
 
     fn fix_test(content: &str) -> String {
+        fix_test_with_file(content, "CLAUDE.md")
+    }
+
+    fn fix_test_with_file(content: &str, agent_file: &str) -> String {
         let mut doc = parse(content);
         let file = NamedTempFile::new().expect("tempfile");
         let ctx = FormatContext {
@@ -238,7 +270,7 @@ mod tests {
             git_tree: None,
             repo_root: None,
         };
-        let errors = validate(&doc, &ctx);
+        let errors = validate(&doc, &ctx, agent_file);
         apply_fixes(&mut doc, &errors);
         serialize(&doc)
     }

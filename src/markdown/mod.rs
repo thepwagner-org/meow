@@ -20,7 +20,7 @@ pub use journal::{
     read_journal, render_entries, render_timeline, CommitEntry, JournalEntry, TimelineItem,
 };
 pub use parse::{
-    is_encrypted, parse, parse_encrypted, serialize, serialize_encrypted,
+    get_frontmatter_error, is_encrypted, parse, parse_encrypted, serialize, serialize_encrypted,
     serialize_with_field_order,
 };
 pub use style::skin;
@@ -44,6 +44,7 @@ pub struct Document {
 /// YAML frontmatter fields.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Frontmatter {
+    #[serde(default, deserialize_with = "deserialize_date")]
     pub created: Option<NaiveDate>,
     pub description: Option<String>,
     pub name: Option<String>,
@@ -76,6 +77,39 @@ pub struct EncryptConfig {
     /// File types that should be encrypted (e.g., ["journal"]).
     #[serde(default)]
     pub files: Vec<String>,
+}
+
+/// Custom deserializer for `created` field that provides helpful error messages.
+fn deserialize_date<'de, D>(deserializer: D) -> Result<Option<NaiveDate>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let value: Option<serde_yaml::Value> = Option::deserialize(deserializer)?;
+
+    let Some(v) = value else {
+        return Ok(None);
+    };
+
+    // If it's a string, try to parse as YYYY-MM-DD
+    if let Some(s) = v.as_str() {
+        return NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .map(Some)
+            .map_err(|_| {
+                D::Error::custom(format!("created: expected date (YYYY-MM-DD), got '{s}'"))
+            });
+    }
+
+    // YAML might parse "2026-01-01 10:51" as a timestamp - format it back
+    // for a helpful error message
+    let formatted = serde_yaml::to_string(&v)
+        .unwrap_or_else(|_| format!("{v:?}"))
+        .trim()
+        .to_string();
+    Err(D::Error::custom(format!(
+        "created: expected date (YYYY-MM-DD), got '{formatted}'"
+    )))
 }
 
 /// A block-level markdown element.
@@ -123,8 +157,8 @@ pub enum Inline {
 #[derive(Debug, Clone)]
 pub enum ValidationError {
     // === Unfixable errors (require user action) ===
-    /// Frontmatter is completely missing.
-    MissingFrontmatter,
+    /// Frontmatter is missing or failed to parse.
+    MissingFrontmatter { reason: Option<String> },
     /// A required frontmatter field is missing.
     MissingRequiredField { line: usize, field: String },
     /// A field has an invalid type or value.
@@ -204,7 +238,7 @@ impl ValidationError {
     /// Get the line number for this error (1-based, 0 = unknown).
     pub fn line(&self) -> usize {
         match self {
-            Self::MissingFrontmatter => 1,
+            Self::MissingFrontmatter { .. } => 1,
             Self::MissingRequiredField { line, .. } => *line,
             Self::InvalidFieldValue { line, .. } => *line,
             Self::InvalidDateFormat { line, .. } => *line,
@@ -232,7 +266,8 @@ impl ValidationError {
     /// Get a human-readable message for this error.
     pub fn message(&self) -> String {
         let base = match self {
-            Self::MissingFrontmatter => "missing frontmatter".to_string(),
+            Self::MissingFrontmatter { reason: None } => "missing frontmatter".to_string(),
+            Self::MissingFrontmatter { reason: Some(r) } => format!("invalid frontmatter: {r}"),
             Self::MissingRequiredField { field, .. } => {
                 format!("missing required field '{}'", field)
             }
@@ -469,6 +504,9 @@ pub struct FormatContext<'a> {
 #[derive(Debug, Clone)]
 pub enum FileType {
     Readme,
+    /// AGENTS.md - canonical agent instruction file (opencode and other agents).
+    Agents,
+    /// CLAUDE.md - agent instruction file for Claude Code (fallback).
     Claude,
     ClaudeCommand,
     Journal,
@@ -477,6 +515,10 @@ pub enum FileType {
     Custom {
         schema: std::sync::Arc<schema::Schema>,
         type_name: String,
+    },
+    /// File is in a schema-covered directory but has no valid type field.
+    UnknownSchemaType {
+        schema: std::sync::Arc<schema::Schema>,
     },
 }
 
@@ -496,6 +538,9 @@ impl FileType {
         // Hardcoded types always win
         if filename == OsStr::new("README.md") {
             return Some(FileType::Readme);
+        }
+        if filename == OsStr::new("AGENTS.md") {
+            return Some(FileType::Agents);
         }
         if filename == OsStr::new("CLAUDE.md") {
             return Some(FileType::Claude);
@@ -525,20 +570,27 @@ impl FileType {
         // Check for schema-driven type
         if let Some(root) = project_root {
             if let Some((schema, _schema_path)) = schema::Schema::find_for_path(path, root) {
+                let schema = std::sync::Arc::new(schema);
                 // Read frontmatter to get type field
                 if let Ok(content) = std::fs::read_to_string(path) {
                     let doc = parse(&content);
                     if let Some(ref fm) = doc.frontmatter {
                         if let Some(ref type_name) = fm.doc_type {
+                            // "none" explicitly opts out of all validation
+                            if type_name == "none" {
+                                return None;
+                            }
                             if schema.types.contains_key(type_name) {
                                 return Some(FileType::Custom {
-                                    schema: std::sync::Arc::new(schema),
+                                    schema,
                                     type_name: type_name.clone(),
                                 });
                             }
                         }
                     }
                 }
+                // File is under schema but has no valid type - report it
+                return Some(FileType::UnknownSchemaType { schema });
             }
         }
 
@@ -549,11 +601,13 @@ impl FileType {
     pub fn validate(&self, doc: &Document, ctx: &FormatContext) -> Vec<ValidationError> {
         match self {
             FileType::Readme => readme::validate(doc, ctx),
-            FileType::Claude => claude::validate(doc, ctx),
+            FileType::Agents => claude::validate(doc, ctx, "AGENTS.md"),
+            FileType::Claude => claude::validate(doc, ctx, "CLAUDE.md"),
             FileType::ClaudeCommand => command::validate(doc, ctx),
             FileType::Journal => journal::validate(doc, ctx),
             FileType::Roadmap => roadmap::validate(doc, ctx),
             FileType::Custom { schema, type_name } => custom::validate(doc, ctx, schema, type_name),
+            FileType::UnknownSchemaType { schema } => custom::validate_unknown_type(doc, schema),
         }
     }
 }

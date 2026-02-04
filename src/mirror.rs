@@ -16,7 +16,15 @@ use std::process::Command;
 /// These are git-tracked files that should remain private.
 /// Build artifacts (target/, node_modules/, etc.) are already excluded
 /// because we use `git ls-files` to enumerate source files.
-pub const HARDCODED_EXCLUDES: &[&str] = &["journal/", ".meow.d/", "CLAUDE.md", ".envrc"];
+pub const HARDCODED_EXCLUDES: &[&str] = &[
+    "journal/",
+    ".meow.d/",
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".claude/",
+    ".opencode/",
+    ".envrc",
+];
 
 /// MIT license text to inject into mirrored repositories.
 const MIT_LICENSE: &str = r#"MIT License
