@@ -2,72 +2,17 @@
 //!
 //! ROADMAP.md files document future possibilities and non-goals.
 //! Validates structure and ensures Non-Goals section exists.
+//!
+//! Validation is handled by the unified schema-driven validator via [`super::schema::builtin_roadmap`].
 
-use super::{Block, Document, FormatContext, ValidationError};
-
-/// Expected non-goals intro text.
-const NON_GOALS_INTRO: &str = "Explicitly out of scope";
+use super::{custom, schema, Document, FormatContext, ValidationError};
 
 /// Validate a ROADMAP.md document.
 ///
 /// Returns both unfixable errors and fixable issues (which will be auto-fixed).
-pub fn validate(doc: &Document, _ctx: &FormatContext) -> Vec<ValidationError> {
-    let mut errors = Vec::new();
-
-    // Check for H1 title
-    let has_h1 = doc
-        .blocks
-        .iter()
-        .any(|b| matches!(b, Block::Heading { level: 1, .. }));
-    if !has_h1 {
-        errors.push(ValidationError::MissingH1 {
-            expected: "Roadmap".to_string(),
-        });
-    }
-
-    // Check for Non-Goals section
-    let non_goals_idx = doc.blocks.iter().position(|b| {
-        matches!(b, Block::Heading { level: 2, .. })
-            && b.heading_text()
-                .map(|t| t.eq_ignore_ascii_case("non-goals"))
-                .unwrap_or(false)
-    });
-
-    match non_goals_idx {
-        None => {
-            errors.push(ValidationError::MissingSection {
-                section: "Non-Goals".to_string(),
-            });
-        }
-        Some(idx) => {
-            // Check if Non-Goals section has intro paragraph
-            let content_idx = doc.blocks[idx + 1..]
-                .iter()
-                .position(|b| !matches!(b, Block::BlankLine))
-                .map(|i| idx + 1 + i);
-
-            let has_intro = content_idx.is_some_and(|i| {
-                if let Some(Block::Paragraph(inlines)) = doc.blocks.get(i) {
-                    let text = super::inlines_to_string(inlines);
-                    text.starts_with(NON_GOALS_INTRO)
-                } else {
-                    false
-                }
-            });
-
-            if !has_intro {
-                // Calculate insert position
-                let insert_idx = if matches!(doc.blocks.get(idx + 1), Some(Block::BlankLine)) {
-                    idx + 2
-                } else {
-                    idx + 1
-                };
-                errors.push(ValidationError::NonGoalsNeedsIntro { insert_idx });
-            }
-        }
-    }
-
-    errors
+pub fn validate(doc: &Document, ctx: &FormatContext) -> Vec<ValidationError> {
+    let type_def = schema::builtin_roadmap();
+    custom::validate_builtin(doc, ctx, &type_def)
 }
 
 #[cfg(test)]

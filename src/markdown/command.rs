@@ -1,29 +1,18 @@
-//! Claude command file validation and formatting.
+//! Claude/opencode command file validation and formatting.
 //!
-//! Claude command files (`.claude/commands/*.md`) define custom slash commands.
-//! Each command file should have an H1 title describing what the command does.
+//! Command files (`.claude/commands/*.md`, `.opencode/command/*.md`) define custom
+//! slash commands. Each command file should have an H1 title.
+//!
+//! Validation is handled by the unified schema-driven validator via [`super::schema::builtin_command`].
 
-use super::{Block, Document, FormatContext, ValidationError};
+use super::{custom, schema, Document, FormatContext, ValidationError};
 
-/// Validate a Claude command document.
+/// Validate a command document.
 ///
 /// Returns both unfixable errors and fixable issues (which will be auto-fixed).
-pub fn validate(doc: &Document, _ctx: &FormatContext) -> Vec<ValidationError> {
-    let mut errors = Vec::new();
-
-    // Check for H1 title (unfixable - we don't know what the command should be named)
-    let has_h1 = doc
-        .blocks
-        .iter()
-        .any(|b| matches!(b, Block::Heading { level: 1, .. }));
-    if !has_h1 {
-        errors.push(ValidationError::SchemaError {
-            line: 1,
-            message: "Claude command should have an H1 title describing the command".to_string(),
-        });
-    }
-
-    errors
+pub fn validate(doc: &Document, ctx: &FormatContext) -> Vec<ValidationError> {
+    let type_def = schema::builtin_command();
+    custom::validate_builtin(doc, ctx, &type_def)
 }
 
 #[cfg(test)]

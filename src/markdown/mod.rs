@@ -128,7 +128,23 @@ pub enum Block {
         language: Option<String>,
         content: String,
     },
+    BlockQuote(Vec<Block>),
+    Table {
+        alignments: Vec<ColumnAlignment>,
+        header: Vec<Vec<Inline>>,
+        rows: Vec<Vec<Vec<Inline>>>,
+    },
+    ThematicBreak,
     BlankLine,
+}
+
+/// Column alignment for table cells.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ColumnAlignment {
+    None,
+    Left,
+    Center,
+    Right,
 }
 
 /// A list item containing inline content and optional nested blocks.
@@ -144,7 +160,9 @@ pub enum Inline {
     Text(String),
     Strong(Vec<Inline>),
     Emphasis(Vec<Inline>),
+    Strikethrough(Vec<Inline>),
     Link { text: String, url: String },
+    Image { alt: String, url: String },
     Code(String),
     SoftBreak,
 }
@@ -212,8 +230,8 @@ pub enum ValidationError {
         preamble: Vec<Block>,
         sorted_entries: Vec<(chrono::NaiveDate, Option<chrono::NaiveTime>, Vec<Block>)>,
     },
-    /// CLAUDE.md Related Documents section needs updating.
-    RelatedDocsNeedsUpdate {
+    /// Auto-managed section needs updating (e.g., Related Documents in CLAUDE.md).
+    ManagedSectionNeedsUpdate {
         /// Index of existing section (if any), or None to append.
         section_start: Option<usize>,
         /// End index of section(s) to replace.
@@ -223,10 +241,12 @@ pub enum ValidationError {
         /// Custom content to preserve after template.
         custom_content: Vec<Block>,
     },
-    /// ROADMAP.md Non-Goals section needs intro paragraph.
-    NonGoalsNeedsIntro {
+    /// Section needs intro paragraph (e.g., Non-Goals in ROADMAP.md).
+    SectionNeedsIntro {
         /// Index where intro should be inserted.
         insert_idx: usize,
+        /// The intro text to insert.
+        text: String,
     },
     /// Date/datetime field needs normalization.
     DateNeedsNormalization { field: String, normalized: String },
@@ -256,8 +276,8 @@ impl ValidationError {
             Self::MissingMonthH1 { .. } => 1,
             Self::LegacyH3Heading { .. } => 1,
             Self::EntriesOutOfOrder { .. } => 1,
-            Self::RelatedDocsNeedsUpdate { .. } => 1,
-            Self::NonGoalsNeedsIntro { .. } => 1,
+            Self::ManagedSectionNeedsUpdate { .. } => 1,
+            Self::SectionNeedsIntro { .. } => 1,
             Self::DateNeedsNormalization { .. } => 1,
             Self::EmptyOptionalSection { .. } => 1,
         }
@@ -323,12 +343,8 @@ impl ValidationError {
             Self::EntriesOutOfOrder { .. } => {
                 "journal entries are out of order (should be newest first)".to_string()
             }
-            Self::RelatedDocsNeedsUpdate { .. } => {
-                "Related Documents section needs updating".to_string()
-            }
-            Self::NonGoalsNeedsIntro { .. } => {
-                "Non-Goals section needs intro paragraph".to_string()
-            }
+            Self::ManagedSectionNeedsUpdate { .. } => "managed section needs updating".to_string(),
+            Self::SectionNeedsIntro { .. } => "section needs intro paragraph".to_string(),
             Self::DateNeedsNormalization { field, normalized } => {
                 format!("field '{}' normalized to '{}'", field, normalized)
             }
@@ -353,8 +369,8 @@ impl ValidationError {
                 | Self::MissingMonthH1 { .. }
                 | Self::LegacyH3Heading { .. }
                 | Self::EntriesOutOfOrder { .. }
-                | Self::RelatedDocsNeedsUpdate { .. }
-                | Self::NonGoalsNeedsIntro { .. }
+                | Self::ManagedSectionNeedsUpdate { .. }
+                | Self::SectionNeedsIntro { .. }
                 | Self::DateNeedsNormalization { .. }
                 | Self::EmptyOptionalSection { .. }
         )
@@ -419,7 +435,7 @@ impl ValidationError {
                     doc.blocks.extend(blocks.clone());
                 }
             }
-            Self::RelatedDocsNeedsUpdate {
+            Self::ManagedSectionNeedsUpdate {
                 section_start,
                 section_end,
                 template_blocks,
@@ -446,10 +462,8 @@ impl ValidationError {
                     }
                 }
             }
-            Self::NonGoalsNeedsIntro { insert_idx } => {
-                let intro = Block::Paragraph(vec![Inline::Text(
-                    "Explicitly out of scope to keep the project focused:".to_string(),
-                )]);
+            Self::SectionNeedsIntro { insert_idx, text } => {
+                let intro = Block::Paragraph(vec![Inline::Text(text.clone())]);
                 doc.blocks.insert(*insert_idx, intro);
             }
             Self::DateNeedsNormalization { field, normalized } => {
@@ -637,7 +651,9 @@ pub fn inlines_to_string(inlines: &[Inline]) -> String {
             Inline::Text(s) => result.push_str(s),
             Inline::Strong(inner) => result.push_str(&inlines_to_string(inner)),
             Inline::Emphasis(inner) => result.push_str(&inlines_to_string(inner)),
+            Inline::Strikethrough(inner) => result.push_str(&inlines_to_string(inner)),
             Inline::Link { text, .. } => result.push_str(text),
+            Inline::Image { alt, .. } => result.push_str(alt),
             Inline::Code(s) => result.push_str(s),
             Inline::SoftBreak => result.push(' '),
         }
@@ -661,9 +677,21 @@ pub fn inlines_to_markdown(inlines: &[Inline]) -> String {
                 result.push_str(&inlines_to_markdown(inner));
                 result.push('*');
             }
+            Inline::Strikethrough(inner) => {
+                result.push_str("~~");
+                result.push_str(&inlines_to_markdown(inner));
+                result.push_str("~~");
+            }
             Inline::Link { text, url } => {
                 result.push('[');
                 result.push_str(text);
+                result.push_str("](");
+                result.push_str(url);
+                result.push(')');
+            }
+            Inline::Image { alt, url } => {
+                result.push_str("![");
+                result.push_str(alt);
                 result.push_str("](");
                 result.push_str(url);
                 result.push(')');
@@ -705,6 +733,24 @@ pub fn validate_bullets_only(
                     message: format!("{context} expects bullet list, found code block"),
                 });
             }
+            Block::BlockQuote(_) => {
+                errors.push(ValidationError::SectionError {
+                    line,
+                    message: format!("{context} expects bullet list, found block quote"),
+                });
+            }
+            Block::ThematicBreak => {
+                errors.push(ValidationError::SectionError {
+                    line,
+                    message: format!("{context} expects bullet list, found thematic break"),
+                });
+            }
+            Block::Table { .. } => {
+                errors.push(ValidationError::SectionError {
+                    line,
+                    message: format!("{context} expects bullet list, found table"),
+                });
+            }
         }
     }
     errors
@@ -722,19 +768,19 @@ pub fn validate_links(doc: &Document, ctx: &FormatContext) -> Vec<ValidationErro
     ) {
         for inline in inlines {
             match inline {
-                Inline::Link { url, .. } if url.is_empty() => {
+                Inline::Link { url, .. } | Inline::Image { url, .. } if url.is_empty() => {
                     errors.push(ValidationError::BrokenLink {
                         line,
                         target: String::new(),
                         reason: "link has empty URL".to_string(),
                     });
                 }
-                Inline::Link { url, .. } => {
+                Inline::Link { url, .. } | Inline::Image { url, .. } => {
                     if let Some(err) = validate_link_exists(url, line, ctx) {
                         errors.push(err);
                     }
                 }
-                Inline::Strong(inner) | Inline::Emphasis(inner) => {
+                Inline::Strong(inner) | Inline::Emphasis(inner) | Inline::Strikethrough(inner) => {
                     check_inlines(inner, line, ctx, errors);
                 }
                 _ => {}
@@ -761,7 +807,21 @@ pub fn validate_links(doc: &Document, ctx: &FormatContext) -> Vec<ValidationErro
                         check_blocks(&item.children, &child_lines, ctx, errors);
                     }
                 }
-                Block::CodeBlock { .. } | Block::BlankLine => {}
+                Block::CodeBlock { .. } | Block::BlankLine | Block::ThematicBreak => {}
+                Block::BlockQuote(inner) => {
+                    let child_lines = vec![line; inner.len()];
+                    check_blocks(inner, &child_lines, ctx, errors);
+                }
+                Block::Table { header, rows, .. } => {
+                    for cell in header {
+                        check_inlines(cell, line, ctx, errors);
+                    }
+                    for row in rows {
+                        for cell in row {
+                            check_inlines(cell, line, ctx, errors);
+                        }
+                    }
+                }
             }
         }
     }

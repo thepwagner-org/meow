@@ -5,20 +5,10 @@
 //!
 //! AGENTS.md is the canonical format (for opencode and other agents).
 //! CLAUDE.md is supported as a fallback for Claude Code.
+//!
+//! Validation is handled by the unified schema-driven validator via [`super::schema::builtin_claude`].
 
-use super::{parse, Block, Document, FormatContext, ValidationError};
-
-/// Soft limit for agent instruction file size (in bytes).
-const SIZE_WARNING_THRESHOLD: usize = 4000;
-
-/// Template for related documents section. `{AGENT_FILE}` is replaced with the actual filename.
-const RELATED_DOCS_TEMPLATE: &str = r#"## Related Documents
-
-- **journal/** - Daily notes in `YYYY-MM.md` files. Log design discussions, investigations, and decisions with `## YYYY-MM-DD` headings.
-- **ROADMAP.md** - Future possibilities and explicit non-goals. Update when brainstorming; don't track completed work here.
-- **{AGENT_FILE}** - How to work on the project: architecture, commands, lints. Keep concise.
-- **../knowledge/** - Personal knowledge base. Read `CLAUDE.md` there for structure; schemas in `.meow.d/`.
-"#;
+use super::{custom, schema, Document, FormatContext, ValidationError};
 
 /// Validate an agent instruction file (AGENTS.md or CLAUDE.md).
 ///
@@ -27,117 +17,8 @@ const RELATED_DOCS_TEMPLATE: &str = r#"## Related Documents
 ///
 /// Returns both unfixable errors and fixable issues (which will be auto-fixed).
 pub fn validate(doc: &Document, ctx: &FormatContext, agent_file: &str) -> Vec<ValidationError> {
-    let mut errors = Vec::new();
-
-    // Warn if file is large
-    if let Ok(content) = std::fs::read_to_string(ctx.path) {
-        if content.len() > SIZE_WARNING_THRESHOLD {
-            errors.push(ValidationError::FileTooLarge {
-                line: 1,
-                size: content.len(),
-                threshold: SIZE_WARNING_THRESHOLD,
-            });
-        }
-    }
-
-    // Check if Related Documents section needs updating
-    let related_docs_section = RELATED_DOCS_TEMPLATE.replace("{AGENT_FILE}", agent_file);
-    let template_doc = parse(&related_docs_section);
-    let template_blocks: Vec<Block> = template_doc.blocks;
-    let template_content_count = template_blocks
-        .iter()
-        .filter(|b| !matches!(b, Block::BlankLine))
-        .count();
-
-    let section_idx = find_related_docs_section(doc);
-
-    match section_idx {
-        Some((idx, legacy_sections)) => {
-            // Find the end of all related sections
-            let last_section_idx = legacy_sections.last().copied().unwrap_or(idx);
-            let section_end = doc.blocks[last_section_idx + 1..]
-                .iter()
-                .position(|b| matches!(b, Block::Heading { level: 2, .. }))
-                .map(|i| last_section_idx + 1 + i)
-                .unwrap_or(doc.blocks.len());
-
-            // Extract existing content blocks (non-blank) in the section
-            let existing_content: Vec<Block> = doc.blocks[idx..section_end]
-                .iter()
-                .filter(|b| !matches!(b, Block::BlankLine))
-                .cloned()
-                .collect();
-
-            // Preserve any additional blocks beyond the template (custom notes)
-            let custom_content: Vec<Block> = if existing_content.len() > template_content_count {
-                existing_content[template_content_count..].to_vec()
-            } else {
-                vec![]
-            };
-
-            // Check if content needs updating (legacy sections or template mismatch)
-            let needs_update = !legacy_sections.is_empty() || {
-                // Compare existing template portion with expected
-                let existing_template_portion: Vec<_> = existing_content
-                    .iter()
-                    .take(template_content_count)
-                    .collect();
-                let expected_template_portion: Vec<_> = template_blocks
-                    .iter()
-                    .filter(|b| !matches!(b, Block::BlankLine))
-                    .collect();
-                existing_template_portion.len() != expected_template_portion.len()
-            };
-
-            if needs_update {
-                errors.push(ValidationError::RelatedDocsNeedsUpdate {
-                    section_start: Some(idx),
-                    section_end,
-                    template_blocks,
-                    custom_content,
-                });
-            }
-        }
-        None => {
-            // Section doesn't exist at all
-            errors.push(ValidationError::RelatedDocsNeedsUpdate {
-                section_start: None,
-                section_end: doc.blocks.len(),
-                template_blocks,
-                custom_content: vec![],
-            });
-        }
-    }
-
-    errors
-}
-
-/// Find the Related Documents section, or legacy Journal/Roadmap sections to migrate.
-/// Returns the index of the first section found and a list of all legacy section indices.
-fn find_related_docs_section(doc: &Document) -> Option<(usize, Vec<usize>)> {
-    let mut legacy_sections = Vec::new();
-    let mut first_idx = None;
-
-    for (i, block) in doc.blocks.iter().enumerate() {
-        if let Block::Heading { level: 2, .. } = block {
-            let text = block.heading_text().unwrap_or_default();
-            let text_lower = text.to_lowercase();
-
-            if text_lower == "related documents" {
-                // Found the canonical section
-                return Some((i, vec![]));
-            }
-
-            if text_lower == "journal" || text_lower == "roadmap" {
-                if first_idx.is_none() {
-                    first_idx = Some(i);
-                }
-                legacy_sections.push(i);
-            }
-        }
-    }
-
-    first_idx.map(|idx| (idx, legacy_sections))
+    let type_def = schema::builtin_claude(agent_file);
+    custom::validate_builtin(doc, ctx, &type_def)
 }
 
 #[cfg(test)]

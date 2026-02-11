@@ -4,8 +4,20 @@ use super::{Block, Document, Frontmatter, Inline, ListItem};
 use crate::crypto;
 use anyhow::{Context, Result};
 use gray_matter::{engine::YAML, Matter};
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use std::collections::VecDeque;
+
+/// Parser options: CommonMark plus GFM tables.
+///
+/// Strikethrough (`ENABLE_STRIKETHROUGH`) is intentionally excluded because
+/// pulldown-cmark treats `~` as a strikethrough delimiter, which corrupts
+/// common prose patterns like `~$5` (approximately $5) into `~~$5` opener.
+/// The AST supports `Inline::Strikethrough` if the option is ever enabled.
+fn parser_options() -> Options {
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    opts
+}
 
 /// Parse markdown content into a Document AST.
 pub fn parse(content: &str) -> Document {
@@ -16,7 +28,7 @@ pub fn parse(content: &str) -> Document {
     let frontmatter: Option<Frontmatter> = parsed.data.and_then(|d| d.deserialize().ok());
 
     // Parse the markdown body - collect events first to avoid borrow issues
-    let parser = Parser::new(&parsed.content);
+    let parser = Parser::new_ext(&parsed.content, parser_options());
     let events: VecDeque<Event> = parser.collect();
     let blocks = parse_blocks(events);
 
@@ -46,7 +58,7 @@ pub fn parse_encrypted(content: &str) -> Result<(Document, Option<String>)> {
 
     if !is_encrypted {
         // Not encrypted, parse normally
-        let parser = Parser::new(&parsed.content);
+        let parser = Parser::new_ext(&parsed.content, parser_options());
         let events: VecDeque<Event> = parser.collect();
         let blocks = parse_blocks(events);
         let fm_lines = count_frontmatter_lines(content);
@@ -82,7 +94,7 @@ pub fn parse_encrypted(content: &str) -> Result<(Document, Option<String>)> {
     // Parse decrypted content as markdown
     let decrypted_str =
         String::from_utf8(decrypted).context("decrypted content is not valid UTF-8")?;
-    let parser = Parser::new(&decrypted_str);
+    let parser = Parser::new_ext(&decrypted_str, parser_options());
     let events: VecDeque<Event> = parser.collect();
     let blocks = parse_blocks(events);
 
@@ -274,6 +286,25 @@ fn parse_blocks(mut events: VecDeque<Event>) -> Vec<Block> {
                 let content = collect_code_block(&mut events);
                 blocks.push(Block::CodeBlock { language, content });
             }
+            Event::Start(Tag::BlockQuote(_kind)) => {
+                let inner_events = collect_container_events(&mut events, |e| {
+                    matches!(e, Event::End(TagEnd::BlockQuote(_)))
+                });
+                let inner_blocks = parse_blocks(inner_events);
+                blocks.push(Block::BlockQuote(inner_blocks));
+            }
+            Event::Start(Tag::Table(alignments)) => {
+                let aligns = alignments.into_iter().map(convert_alignment).collect();
+                let (header, rows) = collect_table(&mut events);
+                blocks.push(Block::Table {
+                    alignments: aligns,
+                    header,
+                    rows,
+                });
+            }
+            Event::Rule => {
+                blocks.push(Block::ThematicBreak);
+            }
             _ => {}
         }
     }
@@ -312,6 +343,18 @@ fn collect_inlines(events: &mut VecDeque<Event>, end_tag: TagEnd) -> Vec<Inline>
                     text,
                     url: dest_url.to_string(),
                 });
+            }
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                let inner = collect_inlines(events, TagEnd::Image);
+                let alt = super::inlines_to_string(&inner);
+                inlines.push(Inline::Image {
+                    alt,
+                    url: dest_url.to_string(),
+                });
+            }
+            Event::Start(Tag::Strikethrough) => {
+                let inner = collect_inlines(events, TagEnd::Strikethrough);
+                inlines.push(Inline::Strikethrough(inner));
             }
             Event::SoftBreak => {
                 inlines.push(Inline::SoftBreak);
@@ -375,6 +418,16 @@ fn collect_item_content(events: &mut VecDeque<Event>) -> (Vec<Inline>, Vec<Block
                 let content = collect_code_block(events);
                 children.push(Block::CodeBlock { language, content });
             }
+            Event::Start(Tag::BlockQuote(_kind)) => {
+                let inner_events = collect_container_events(events, |e| {
+                    matches!(e, Event::End(TagEnd::BlockQuote(_)))
+                });
+                let inner_blocks = parse_blocks(inner_events);
+                children.push(Block::BlockQuote(inner_blocks));
+            }
+            Event::Rule => {
+                children.push(Block::ThematicBreak);
+            }
             Event::Text(text) => {
                 inlines.push(Inline::Text(text.to_string()));
                 first_paragraph = false;
@@ -402,6 +455,20 @@ fn collect_item_content(events: &mut VecDeque<Event>) -> (Vec<Inline>, Vec<Block
                 });
                 first_paragraph = false;
             }
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                let inner = collect_inlines(events, TagEnd::Image);
+                let alt = super::inlines_to_string(&inner);
+                inlines.push(Inline::Image {
+                    alt,
+                    url: dest_url.to_string(),
+                });
+                first_paragraph = false;
+            }
+            Event::Start(Tag::Strikethrough) => {
+                let inner = collect_inlines(events, TagEnd::Strikethrough);
+                inlines.push(Inline::Strikethrough(inner));
+                first_paragraph = false;
+            }
             Event::SoftBreak => {
                 inlines.push(Inline::SoftBreak);
             }
@@ -425,6 +492,77 @@ fn collect_code_block(events: &mut VecDeque<Event>) -> String {
     }
 
     content
+}
+
+/// Collect all events from the queue until the predicate matches an event,
+/// consuming that closing event. Returns the collected inner events.
+fn collect_container_events<'a, F>(
+    events: &mut VecDeque<Event<'a>>,
+    is_end: F,
+) -> VecDeque<Event<'a>>
+where
+    F: Fn(&Event) -> bool,
+{
+    let mut inner = VecDeque::new();
+    while let Some(event) = events.pop_front() {
+        if is_end(&event) {
+            break;
+        }
+        inner.push_back(event);
+    }
+    inner
+}
+
+/// Convert pulldown-cmark alignment to our local enum.
+fn convert_alignment(align: pulldown_cmark::Alignment) -> super::ColumnAlignment {
+    match align {
+        pulldown_cmark::Alignment::None => super::ColumnAlignment::None,
+        pulldown_cmark::Alignment::Left => super::ColumnAlignment::Left,
+        pulldown_cmark::Alignment::Center => super::ColumnAlignment::Center,
+        pulldown_cmark::Alignment::Right => super::ColumnAlignment::Right,
+    }
+}
+
+/// Collect a table's header row and body rows from events.
+/// Expects events starting after `Start(Tag::Table(...))`, up through `End(TagEnd::Table)`.
+fn collect_table(events: &mut VecDeque<Event>) -> (Vec<Vec<Inline>>, Vec<Vec<Vec<Inline>>>) {
+    let mut header = Vec::new();
+    let mut rows = Vec::new();
+
+    while let Some(event) = events.pop_front() {
+        match event {
+            Event::End(TagEnd::Table) => break,
+            Event::Start(Tag::TableHead) => {
+                // The header contains a single row of cells
+                header = collect_table_row(events, TagEnd::TableHead);
+            }
+            Event::Start(Tag::TableRow) => {
+                let row = collect_table_row(events, TagEnd::TableRow);
+                rows.push(row);
+            }
+            _ => {}
+        }
+    }
+
+    (header, rows)
+}
+
+/// Collect a single table row (header or body) as a vec of cells.
+fn collect_table_row(events: &mut VecDeque<Event>, end_tag: TagEnd) -> Vec<Vec<Inline>> {
+    let mut cells = Vec::new();
+
+    while let Some(event) = events.pop_front() {
+        match event {
+            Event::End(tag) if tag == end_tag => break,
+            Event::Start(Tag::TableCell) => {
+                let cell = collect_inlines(events, TagEnd::TableCell);
+                cells.push(cell);
+            }
+            _ => {}
+        }
+    }
+
+    cells
 }
 
 /// Ensure there's a blank line after each heading.
@@ -466,7 +604,7 @@ fn count_frontmatter_lines(content: &str) -> usize {
 /// to line numbers. `Block::BlankLine` entries (synthetic, from `normalize_blank_lines`)
 /// are assigned line 0 (unknown).
 fn compute_block_lines(body: &str, blocks: &[Block], fm_lines: usize) -> Vec<usize> {
-    use pulldown_cmark::{Event, Options, Tag};
+    use pulldown_cmark::{Event, Tag};
 
     // Build a line-start offset table for the body
     let line_starts: Vec<usize> = std::iter::once(0)
@@ -474,7 +612,7 @@ fn compute_block_lines(body: &str, blocks: &[Block], fm_lines: usize) -> Vec<usi
         .collect();
 
     // Collect byte offsets of top-level block-start events
-    let parser = pulldown_cmark::Parser::new_ext(body, Options::empty());
+    let parser = pulldown_cmark::Parser::new_ext(body, parser_options());
     let mut block_offsets: Vec<usize> = Vec::new();
     let mut depth: usize = 0;
 
@@ -483,7 +621,9 @@ fn compute_block_lines(body: &str, blocks: &[Block], fm_lines: usize) -> Vec<usi
             Event::Start(Tag::Heading { .. })
             | Event::Start(Tag::Paragraph)
             | Event::Start(Tag::List(_))
-            | Event::Start(Tag::CodeBlock(_)) => {
+            | Event::Start(Tag::CodeBlock(_))
+            | Event::Start(Tag::BlockQuote(_))
+            | Event::Start(Tag::Table(_)) => {
                 if depth == 0 {
                     block_offsets.push(range.start);
                 }
@@ -491,6 +631,11 @@ fn compute_block_lines(body: &str, blocks: &[Block], fm_lines: usize) -> Vec<usi
             }
             Event::End(_) => {
                 depth = depth.saturating_sub(1);
+            }
+            Event::Rule => {
+                if depth == 0 {
+                    block_offsets.push(range.start);
+                }
             }
             _ => {}
         }
@@ -588,9 +733,12 @@ pub fn serialize_with_field_order(doc: &Document, field_order: Option<&[&str]>) 
 
     // Write blocks
     for (i, block) in doc.blocks.iter().enumerate() {
-        // Add blank line before headings (except first block)
-        if matches!(block, Block::Heading { .. })
-            && i > 0
+        // Add blank line before headings, thematic breaks, and block quotes
+        // (except first block) to prevent CommonMark ambiguity (e.g. setext headings)
+        if matches!(
+            block,
+            Block::Heading { .. } | Block::ThematicBreak | Block::BlockQuote(_)
+        ) && i > 0
             && !matches!(doc.blocks.get(i - 1), Some(Block::BlankLine))
         {
             output.push('\n');
@@ -616,6 +764,19 @@ pub fn serialize_with_field_order(doc: &Document, field_order: Option<&[&str]>) 
                     output.push('\n');
                 }
                 output.push_str("```\n");
+            }
+            Block::BlockQuote(inner) => {
+                serialize_blockquote(&mut output, inner);
+            }
+            Block::Table {
+                alignments,
+                header,
+                rows,
+            } => {
+                serialize_table(&mut output, alignments, header, rows, "");
+            }
+            Block::ThematicBreak => {
+                output.push_str("---\n");
             }
             Block::BlankLine => {
                 output.push('\n');
@@ -651,8 +812,16 @@ fn serialize_inlines(inlines: &[Inline]) -> String {
                 result.push_str(&serialize_inlines(inner));
                 result.push('*');
             }
+            Inline::Strikethrough(inner) => {
+                result.push_str("~~");
+                result.push_str(&serialize_inlines(inner));
+                result.push_str("~~");
+            }
             Inline::Link { text, url } => {
                 result.push_str(&format!("[{text}]({url})"));
+            }
+            Inline::Image { alt, url } => {
+                result.push_str(&format!("![{alt}]({url})"));
             }
             Inline::Code(s) => {
                 result.push_str(&format!("`{s}`"));
@@ -719,10 +888,105 @@ fn serialize_blocks(output: &mut String, blocks: &[Block], indent: &str) {
                 output.push_str(indent);
                 output.push_str("```\n");
             }
+            Block::BlockQuote(inner) => {
+                // Serialize inner blocks then prefix each line with indent + "> "
+                let mut bq = String::new();
+                serialize_blockquote(&mut bq, inner);
+                for line in bq.lines() {
+                    output.push_str(indent);
+                    output.push_str(line);
+                    output.push('\n');
+                }
+            }
+            Block::Table {
+                alignments,
+                header,
+                rows,
+            } => {
+                serialize_table(output, alignments, header, rows, indent);
+            }
+            Block::ThematicBreak => {
+                output.push_str(indent);
+                output.push_str("---\n");
+            }
             Block::BlankLine => {
                 output.push('\n');
             }
         }
+    }
+}
+
+/// Serialize a blockquote's inner blocks, prefixing each line with `> `.
+fn serialize_blockquote(output: &mut String, inner: &[Block]) {
+    let inner_doc = Document {
+        frontmatter: None,
+        blocks: inner.to_vec(),
+        block_lines: vec![],
+    };
+    let inner_text = serialize(&inner_doc);
+    // Trim trailing newline — we add our own line endings
+    let trimmed = inner_text.trim_end_matches('\n');
+    for line in trimmed.split('\n') {
+        if line.is_empty() {
+            output.push_str(">\n");
+        } else {
+            output.push_str("> ");
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+}
+
+/// Serialize a table in GFM pipe syntax.
+fn serialize_table(
+    output: &mut String,
+    alignments: &[super::ColumnAlignment],
+    header: &[Vec<Inline>],
+    rows: &[Vec<Vec<Inline>>],
+    indent: &str,
+) {
+    let num_cols = alignments.len().max(header.len());
+
+    // Header row
+    output.push_str(indent);
+    output.push('|');
+    for i in 0..num_cols {
+        let cell = header
+            .get(i)
+            .map(|c| serialize_inlines(c))
+            .unwrap_or_default();
+        output.push_str(&format!(" {} |", cell));
+    }
+    output.push('\n');
+
+    // Alignment row
+    output.push_str(indent);
+    output.push('|');
+    for i in 0..num_cols {
+        let align = alignments
+            .get(i)
+            .copied()
+            .unwrap_or(super::ColumnAlignment::None);
+        let sep = match align {
+            super::ColumnAlignment::None => " --- ",
+            super::ColumnAlignment::Left => " :--- ",
+            super::ColumnAlignment::Center => " :---: ",
+            super::ColumnAlignment::Right => " ---: ",
+        };
+        output.push_str(sep);
+        output.push('|');
+    }
+    output.push('\n');
+
+    // Body rows
+    for row in rows {
+        output.push_str(indent);
+        output.push('|');
+        for i in 0..num_cols {
+            let cell = row.get(i).map(|c| serialize_inlines(c)).unwrap_or_default();
+            output.push_str(&format!(" {} |", cell));
+        }
+        output.push('\n');
     }
 }
 
@@ -1123,6 +1387,300 @@ alpha: a
         assert!(
             alpha_pos < zebra_pos,
             "alpha should come before zebra in output:\n{}",
+            serialized
+        );
+    }
+
+    #[test]
+    fn test_parse_blockquote() {
+        let doc = parse("> Some quoted text\n");
+        // Should have a BlockQuote containing a Paragraph
+        let found = doc.blocks.iter().any(|b| matches!(b, Block::BlockQuote(_)));
+        assert!(found, "Should parse blockquote, got: {:?}", doc.blocks);
+        if let Block::BlockQuote(inner) = &doc.blocks[0] {
+            let has_para = inner.iter().any(|b| matches!(b, Block::Paragraph(_)));
+            assert!(has_para, "Blockquote should contain paragraph");
+        }
+    }
+
+    #[test]
+    fn test_blockquote_roundtrip() {
+        let content = "> *Go ask Alice / I think she'll know* — Jefferson Airplane\n";
+        let doc = parse(content);
+        let serialized = serialize(&doc);
+        assert!(
+            serialized.contains("> "),
+            "Serialized output should contain blockquote marker, got:\n{}",
+            serialized
+        );
+        // Round-trip: parse again and re-serialize should be identical
+        let doc2 = parse(&serialized);
+        let serialized2 = serialize(&doc2);
+        assert_eq!(
+            serialized, serialized2,
+            "Blockquote round-trip should be idempotent"
+        );
+    }
+
+    #[test]
+    fn test_nested_blockquote_roundtrip() {
+        let content = "> Outer quote\n>\n> > Inner quote\n";
+        let doc = parse(content);
+        let serialized = serialize(&doc);
+        assert!(
+            serialized.contains("> > "),
+            "Should preserve nested blockquote, got:\n{}",
+            serialized
+        );
+        let doc2 = parse(&serialized);
+        let serialized2 = serialize(&doc2);
+        assert_eq!(
+            serialized, serialized2,
+            "Nested blockquote round-trip should be idempotent"
+        );
+    }
+
+    #[test]
+    fn test_parse_thematic_break() {
+        let doc = parse("Some text\n\n---\n\nMore text\n");
+        let found = doc.blocks.iter().any(|b| matches!(b, Block::ThematicBreak));
+        assert!(found, "Should parse thematic break, got: {:?}", doc.blocks);
+    }
+
+    #[test]
+    fn test_thematic_break_roundtrip() {
+        let content = "Some text\n\n---\n\nMore text\n";
+        let doc = parse(content);
+        let serialized = serialize(&doc);
+        assert!(
+            serialized.contains("---"),
+            "Serialized output should contain thematic break, got:\n{}",
+            serialized
+        );
+        let doc2 = parse(&serialized);
+        let serialized2 = serialize(&doc2);
+        assert_eq!(
+            serialized, serialized2,
+            "Thematic break round-trip should be idempotent"
+        );
+    }
+
+    #[test]
+    fn test_blockquote_after_paragraph() {
+        // The alice README pattern: paragraph followed by blockquote
+        let content = "A sanitizing HTTPS proxy.\n\n> *Go ask Alice* — Jefferson Airplane\n";
+        let doc = parse(content);
+        let serialized = serialize(&doc);
+        assert!(
+            serialized.contains("> "),
+            "Blockquote after paragraph should survive, got:\n{}",
+            serialized
+        );
+        assert!(
+            serialized.contains("*Go ask Alice*"),
+            "Emphasis inside blockquote should survive, got:\n{}",
+            serialized
+        );
+    }
+
+    #[test]
+    fn test_thematic_break_before_italic() {
+        // The alice README pattern: thematic break separating content
+        let content =
+            "See [SECURITY.md](SECURITY.md) for the full threat model.\n\n---\n\n*Go ask Alice* — Jefferson Airplane\n";
+        let doc = parse(content);
+        let serialized = serialize(&doc);
+        assert!(
+            serialized.contains("---"),
+            "Thematic break should survive, got:\n{}",
+            serialized
+        );
+        assert!(
+            serialized.contains("*Go ask Alice*"),
+            "Italic text after thematic break should survive, got:\n{}",
+            serialized
+        );
+    }
+
+    #[test]
+    fn test_parse_image() {
+        let doc = parse("![screenshot](images/shot.png)\n");
+        if let Block::Paragraph(inlines) = &doc.blocks[0] {
+            let has_image = inlines.iter().any(|i| {
+                matches!(i, Inline::Image { alt, url } if alt == "screenshot" && url == "images/shot.png")
+            });
+            assert!(has_image, "Should contain image, got: {:?}", inlines);
+        } else {
+            panic!("Expected paragraph, got: {:?}", doc.blocks[0]);
+        }
+    }
+
+    #[test]
+    fn test_image_roundtrip() {
+        let content = "![alt text](path/to/image.png)\n";
+        let doc = parse(content);
+        let serialized = serialize(&doc);
+        assert!(
+            serialized.contains("![alt text](path/to/image.png)"),
+            "Image should survive round-trip, got:\n{}",
+            serialized
+        );
+        let doc2 = parse(&serialized);
+        let serialized2 = serialize(&doc2);
+        assert_eq!(
+            serialized, serialized2,
+            "Image round-trip should be idempotent"
+        );
+    }
+
+    #[test]
+    fn test_image_in_paragraph() {
+        let content = "Here is a screenshot: ![demo](demo.gif) showing the feature.\n";
+        let doc = parse(content);
+        let serialized = serialize(&doc);
+        assert!(
+            serialized.contains("![demo](demo.gif)"),
+            "Inline image should survive, got:\n{}",
+            serialized
+        );
+        assert!(
+            serialized.contains("Here is a screenshot:"),
+            "Surrounding text should survive, got:\n{}",
+            serialized
+        );
+    }
+
+    #[test]
+    fn test_strikethrough_literal_roundtrip() {
+        // Strikethrough parsing is disabled to avoid corrupting `~$5` patterns,
+        // but `~~text~~` should survive as literal text.
+        let content = "This is ~~deleted~~ text.\n";
+        let doc = parse(content);
+        let serialized = serialize(&doc);
+        assert!(
+            serialized.contains("~~deleted~~"),
+            "Literal ~~ should survive round-trip, got:\n{}",
+            serialized
+        );
+        let doc2 = parse(&serialized);
+        let serialized2 = serialize(&doc2);
+        assert_eq!(
+            serialized, serialized2,
+            "Literal ~~ round-trip should be idempotent"
+        );
+    }
+
+    #[test]
+    fn test_tilde_not_corrupted() {
+        // Regression: `~$5` must not become `~~$5` (strikethrough opener)
+        let content = "Costs ~$5 per unit.\n";
+        let doc = parse(content);
+        let serialized = serialize(&doc);
+        assert!(
+            serialized.contains("~$5"),
+            "Tilde-dollar should not be corrupted, got:\n{}",
+            serialized
+        );
+        assert!(
+            !serialized.contains("~~"),
+            "Should not introduce strikethrough markers, got:\n{}",
+            serialized
+        );
+    }
+
+    #[test]
+    fn test_parse_table() {
+        let content = "| Name | Age |\n| --- | --- |\n| Alice | 30 |\n| Bob | 25 |\n";
+        let doc = parse(content);
+        let found = doc.blocks.iter().any(|b| matches!(b, Block::Table { .. }));
+        assert!(found, "Should parse table, got: {:?}", doc.blocks);
+        if let Block::Table {
+            header,
+            rows,
+            alignments,
+        } = &doc.blocks[0]
+        {
+            assert_eq!(header.len(), 2, "Should have 2 header cells");
+            assert_eq!(rows.len(), 2, "Should have 2 body rows");
+            assert_eq!(alignments.len(), 2, "Should have 2 alignment specs");
+        }
+    }
+
+    #[test]
+    fn test_table_roundtrip() {
+        let content = "| Name | Age |\n| --- | --- |\n| Alice | 30 |\n| Bob | 25 |\n";
+        let doc = parse(content);
+        let serialized = serialize(&doc);
+        assert!(
+            serialized.contains("| Name |") && serialized.contains("| Alice |"),
+            "Table should survive round-trip, got:\n{}",
+            serialized
+        );
+        let doc2 = parse(&serialized);
+        let serialized2 = serialize(&doc2);
+        assert_eq!(
+            serialized, serialized2,
+            "Table round-trip should be idempotent"
+        );
+    }
+
+    #[test]
+    fn test_table_with_alignment() {
+        let content = "| Left | Center | Right |\n| :--- | :---: | ---: |\n| a | b | c |\n";
+        let doc = parse(content);
+        if let Block::Table { alignments, .. } = &doc.blocks[0] {
+            assert_eq!(alignments[0], crate::markdown::ColumnAlignment::Left);
+            assert_eq!(alignments[1], crate::markdown::ColumnAlignment::Center);
+            assert_eq!(alignments[2], crate::markdown::ColumnAlignment::Right);
+        } else {
+            panic!("Expected table, got: {:?}", doc.blocks[0]);
+        }
+        // Round-trip
+        let serialized = serialize(&doc);
+        assert!(
+            serialized.contains(":---"),
+            "Should preserve left alignment"
+        );
+        assert!(
+            serialized.contains(":---:"),
+            "Should preserve center alignment"
+        );
+        assert!(
+            serialized.contains("---:"),
+            "Should preserve right alignment"
+        );
+        let doc2 = parse(&serialized);
+        let serialized2 = serialize(&doc2);
+        assert_eq!(
+            serialized, serialized2,
+            "Table with alignment round-trip should be idempotent"
+        );
+    }
+
+    #[test]
+    fn test_table_with_inline_formatting() {
+        let content =
+            "| Feature | Status |\n| --- | --- |\n| **Bold** | ~~removed~~ |\n| [link](url) | `code` |\n";
+        let doc = parse(content);
+        let serialized = serialize(&doc);
+        assert!(
+            serialized.contains("**Bold**"),
+            "Bold in table should survive, got:\n{}",
+            serialized
+        );
+        assert!(
+            serialized.contains("~~removed~~"),
+            "Strikethrough in table should survive, got:\n{}",
+            serialized
+        );
+        assert!(
+            serialized.contains("[link](url)"),
+            "Link in table should survive, got:\n{}",
+            serialized
+        );
+        assert!(
+            serialized.contains("`code`"),
+            "Code in table should survive, got:\n{}",
             serialized
         );
     }

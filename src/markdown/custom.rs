@@ -1,16 +1,17 @@
 //! Schema-driven markdown validation and normalization.
 //!
-//! This module handles documents that are validated against `.meow.d/` definitions.
+//! This module handles documents validated against type definitions — both
+//! schema-driven (`.meow.d/`) and built-in (README, CLAUDE, ROADMAP, etc.).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::{
-    normalize_path,
-    schema::{FieldType, LinksDef, Schema, TypeDef},
-    urlencoding_decode, validate_bullets_only, validate_link_exists, Block, Document,
-    FormatContext, Inline, ValidationError,
+    normalize_path, parse,
+    schema::{FieldType, LinksDef, ManagedContent, Schema, TitleMode, TypeDef},
+    urlencoding_decode, validate_bullets_only, validate_link_exists, validate_links, Block,
+    Document, FormatContext, Inline, ValidationError,
 };
 use chrono::NaiveDate;
 
@@ -62,7 +63,66 @@ pub fn validate(
 
     validate_fields(fm, type_def, &mut errors);
     validate_frontmatter_links(fm, type_def, ctx, &mut errors);
-    validate_structure(doc, ctx, schema, type_name, type_def, &mut errors);
+    validate_structure(
+        doc,
+        ctx,
+        Some(schema),
+        Some(type_name),
+        type_def,
+        &mut errors,
+    );
+    errors
+}
+
+/// Validate a document against a built-in type definition.
+///
+/// Unlike `validate()`, this doesn't require a Schema or type field in frontmatter.
+/// Used for README, CLAUDE, ROADMAP, and command files.
+pub fn validate_builtin(
+    doc: &Document,
+    ctx: &FormatContext,
+    type_def: &TypeDef,
+) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    // Size warning
+    if let Some(threshold) = type_def.structure.size_warning {
+        if let Ok(content) = std::fs::read_to_string(ctx.path) {
+            if content.len() > threshold {
+                errors.push(ValidationError::FileTooLarge {
+                    line: 1,
+                    size: content.len(),
+                    threshold,
+                });
+            }
+        }
+    }
+
+    // Check if frontmatter is needed
+    let needs_frontmatter =
+        type_def.structure.frontmatter.iter().any(|f| f.required) || !type_def.fields.is_empty();
+
+    if needs_frontmatter {
+        match &doc.frontmatter {
+            None => {
+                errors.push(ValidationError::MissingFrontmatter { reason: None });
+                return errors;
+            }
+            Some(fm) => {
+                validate_fields(fm, type_def, &mut errors);
+                validate_frontmatter_links(fm, type_def, ctx, &mut errors);
+            }
+        }
+    }
+
+    // Structure validation (no schema for bidirectional links)
+    validate_structure(doc, ctx, None, None, type_def, &mut errors);
+
+    // All-links validation
+    if type_def.structure.validate_all_links {
+        errors.extend(validate_links(doc, ctx));
+    }
+
     errors
 }
 
@@ -105,8 +165,8 @@ pub fn validate_unknown_type(doc: &Document, schema: &Schema) -> Vec<ValidationE
 fn validate_structure(
     doc: &Document,
     ctx: &FormatContext,
-    schema: &Schema,
-    source_type: &str,
+    schema: Option<&Schema>,
+    source_type: Option<&str>,
     type_def: &TypeDef,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -121,21 +181,61 @@ fn validate_structure(
         _ => None,
     });
 
-    // Validate title matches filename
-    if structure.title_from_filename {
-        let expected_title = ctx.path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-
-        match &h1_info {
-            Some((title, _)) if title == expected_title => {}
-            Some((title, line)) => {
-                errors.push(ValidationError::SectionError {
-                    line: *line,
-                    message: format!("title '{}' must match filename '{}'", title, expected_title),
+    // Validate title based on mode
+    match &structure.title {
+        TitleMode::None => {}
+        TitleMode::FromFilename => {
+            let expected_title = ctx.path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            match &h1_info {
+                Some((title, _)) if title == expected_title => {}
+                Some((title, line)) => {
+                    errors.push(ValidationError::SectionError {
+                        line: *line,
+                        message: format!(
+                            "title '{}' must match filename '{}'",
+                            title, expected_title
+                        ),
+                    });
+                }
+                None => {
+                    errors.push(ValidationError::MissingH1 {
+                        expected: expected_title.to_string(),
+                    });
+                }
+            }
+        }
+        TitleMode::FromProject => {
+            let expected_title = doc
+                .frontmatter
+                .as_ref()
+                .and_then(|fm| fm.name.clone())
+                .unwrap_or_else(|| ctx.project.to_string());
+            match &h1_info {
+                Some((title, _)) if *title == expected_title => {}
+                Some(_) => {
+                    errors.push(ValidationError::H1Mismatch {
+                        expected: expected_title,
+                    });
+                }
+                None => {
+                    errors.push(ValidationError::MissingH1 {
+                        expected: expected_title,
+                    });
+                }
+            }
+        }
+        TitleMode::Fixed(expected) => {
+            if h1_info.is_none() {
+                errors.push(ValidationError::MissingH1 {
+                    expected: expected.clone(),
                 });
             }
-            None => {
-                errors.push(ValidationError::MissingH1 {
-                    expected: expected_title.to_string(),
+        }
+        TitleMode::RequiredAny => {
+            if h1_info.is_none() {
+                errors.push(ValidationError::SchemaError {
+                    line: 1,
+                    message: "document should have an H1 title".to_string(),
                 });
             }
         }
@@ -168,31 +268,33 @@ fn validate_structure(
             })
             .collect();
 
-        // Check each H2 is in the allowed list
-        for (_idx, h2, line) in &h2_info {
-            if !allowed_titles.contains(&h2.as_str()) {
-                errors.push(ValidationError::SectionError {
-                    line: *line,
-                    message: format!(
-                        "unexpected section '{}' (allowed: {})",
-                        h2,
-                        allowed_titles.join(", ")
-                    ),
-                });
-            }
-        }
-
-        // Check ordering: for each pair of sections that both appear, first must come before second
-        let mut last_allowed_idx = 0;
-        for (_idx, h2, line) in &h2_info {
-            if let Some(idx) = allowed_titles.iter().position(|s| *s == h2) {
-                if idx < last_allowed_idx {
+        // Strict mode: check each H2 is in the allowed list and enforce ordering
+        if structure.strict_sections {
+            for (_idx, h2, line) in &h2_info {
+                if !allowed_titles.contains(&h2.as_str()) {
                     errors.push(ValidationError::SectionError {
                         line: *line,
-                        message: format!("section '{}' appears out of order", h2),
+                        message: format!(
+                            "unexpected section '{}' (allowed: {})",
+                            h2,
+                            allowed_titles.join(", ")
+                        ),
                     });
                 }
-                last_allowed_idx = idx;
+            }
+
+            // Check ordering: for each pair of sections that both appear, first must come before second
+            let mut last_allowed_idx = 0;
+            for (_idx, h2, line) in &h2_info {
+                if let Some(idx) = allowed_titles.iter().position(|s| *s == h2) {
+                    if idx < last_allowed_idx {
+                        errors.push(ValidationError::SectionError {
+                            line: *line,
+                            message: format!("section '{}' appears out of order", h2),
+                        });
+                    }
+                    last_allowed_idx = idx;
+                }
             }
         }
 
@@ -207,6 +309,13 @@ fn validate_structure(
 
         // Validate section content format (bullets by default)
         validate_section_content(doc, structure, schema, source_type, ctx, errors);
+    }
+
+    // Validate managed content sections (auto-managed sections like Related Documents)
+    for section_def in &structure.sections {
+        if let Some(ref managed) = section_def.managed_content {
+            validate_managed_section(doc, &section_def.title, managed, errors);
+        }
     }
 }
 
@@ -256,8 +365,8 @@ fn validate_intro_content(
 fn validate_section_content(
     doc: &Document,
     structure: &super::schema::StructureDef,
-    schema: &Schema,
-    source_type: &str,
+    schema: Option<&Schema>,
+    source_type: Option<&str>,
     ctx: &FormatContext,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -286,6 +395,22 @@ fn validate_section_content(
             continue; // Unknown section, already reported
         };
 
+        // Find end position (next H2 or end of document)
+        let end_pos = h2_positions
+            .get(pos_idx + 1)
+            .map(|(pos, _)| *pos)
+            .unwrap_or(doc.blocks.len());
+
+        // Validate intro_text if defined
+        if let Some(ref intro_text) = section_def.intro_text {
+            validate_section_intro(doc, *start_pos, end_pos, intro_text, errors);
+        }
+
+        // Skip managed content sections (validated separately)
+        if section_def.managed_content.is_some() {
+            continue;
+        }
+
         // Skip if paragraphs are allowed
         if section_def.paragraph {
             continue;
@@ -294,18 +419,13 @@ fn validate_section_content(
         // Parse template if present
         let template_segments = section_def.template.as_ref().map(|t| parse_template(t));
 
-        // Find end position (next H2 or end of document)
-        let end_pos = h2_positions
-            .get(pos_idx + 1)
-            .map(|(pos, _)| *pos)
-            .unwrap_or(doc.blocks.len());
-
         let section_blocks = &doc.blocks[start_pos + 1..end_pos];
+        const EMPTY_SECTION_LINES: &[usize] = &[];
         let section_lines =
             if start_pos + 1 < doc.block_lines.len() && end_pos <= doc.block_lines.len() {
                 &doc.block_lines[start_pos + 1..end_pos]
             } else {
-                &[]
+                EMPTY_SECTION_LINES
             };
 
         // Validate bullets only (no paragraphs/code blocks)
@@ -336,20 +456,165 @@ fn validate_section_content(
             }
         }
 
-        // Validate section link constraints
-        if let Some(ref links_def) = section_def.links {
-            validate_section_links(
-                doc,
-                section_title,
-                heading_line,
-                links_def,
-                schema,
-                source_type,
-                ctx,
-                errors,
-            );
+        // Validate section link constraints (requires schema context)
+        if let (Some(schema), Some(source_type)) = (schema, source_type) {
+            if let Some(ref links_def) = section_def.links {
+                validate_section_links(
+                    doc,
+                    section_title,
+                    heading_line,
+                    links_def,
+                    schema,
+                    source_type,
+                    ctx,
+                    errors,
+                );
+            }
         }
     }
+}
+
+/// Validate that a section has the required intro paragraph.
+fn validate_section_intro(
+    doc: &Document,
+    section_start: usize,
+    section_end: usize,
+    intro_text: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    let content_start = section_start + 1;
+    let content_idx = doc.blocks[content_start..section_end]
+        .iter()
+        .position(|b| !matches!(b, Block::BlankLine))
+        .map(|i| content_start + i);
+
+    let has_intro = content_idx.is_some_and(|i| {
+        if let Some(Block::Paragraph(inlines)) = doc.blocks.get(i) {
+            let text = super::inlines_to_string(inlines);
+            text.starts_with(intro_text)
+        } else {
+            false
+        }
+    });
+
+    if !has_intro {
+        let insert_idx = if matches!(doc.blocks.get(content_start), Some(Block::BlankLine)) {
+            content_start + 1
+        } else {
+            content_start
+        };
+        errors.push(ValidationError::SectionNeedsIntro {
+            insert_idx,
+            text: intro_text.to_string(),
+        });
+    }
+}
+
+/// Validate a managed content section (auto-managed sections like Related Documents).
+fn validate_managed_section(
+    doc: &Document,
+    section_title: &str,
+    managed: &ManagedContent,
+    errors: &mut Vec<ValidationError>,
+) {
+    let template_doc = parse(&managed.template);
+    let template_blocks: Vec<Block> = template_doc.blocks;
+    let template_content_count = template_blocks
+        .iter()
+        .filter(|b| !matches!(b, Block::BlankLine))
+        .count();
+
+    let section_idx = find_managed_section(doc, section_title, &managed.migrate_from);
+
+    match section_idx {
+        Some((idx, legacy_sections)) => {
+            // Find the end of all related sections
+            let last_section_idx = legacy_sections.last().copied().unwrap_or(idx);
+            let section_end = doc.blocks[last_section_idx + 1..]
+                .iter()
+                .position(|b| matches!(b, Block::Heading { level: 2, .. }))
+                .map(|i| last_section_idx + 1 + i)
+                .unwrap_or(doc.blocks.len());
+
+            // Extract existing content blocks (non-blank) in the section
+            let existing_content: Vec<Block> = doc.blocks[idx..section_end]
+                .iter()
+                .filter(|b| !matches!(b, Block::BlankLine))
+                .cloned()
+                .collect();
+
+            // Preserve any additional blocks beyond the template (custom notes)
+            let custom_content: Vec<Block> = if existing_content.len() > template_content_count {
+                existing_content[template_content_count..].to_vec()
+            } else {
+                vec![]
+            };
+
+            // Check if content needs updating (legacy sections or template mismatch)
+            let needs_update = !legacy_sections.is_empty() || {
+                let existing_template_portion: Vec<_> = existing_content
+                    .iter()
+                    .take(template_content_count)
+                    .collect();
+                let expected_template_portion: Vec<_> = template_blocks
+                    .iter()
+                    .filter(|b| !matches!(b, Block::BlankLine))
+                    .collect();
+                existing_template_portion.len() != expected_template_portion.len()
+            };
+
+            if needs_update {
+                errors.push(ValidationError::ManagedSectionNeedsUpdate {
+                    section_start: Some(idx),
+                    section_end,
+                    template_blocks,
+                    custom_content,
+                });
+            }
+        }
+        None => {
+            // Section doesn't exist at all
+            errors.push(ValidationError::ManagedSectionNeedsUpdate {
+                section_start: None,
+                section_end: doc.blocks.len(),
+                template_blocks,
+                custom_content: vec![],
+            });
+        }
+    }
+}
+
+/// Find a managed section by title, or legacy sections to migrate from.
+///
+/// Returns the index of the first section found and a list of all legacy section indices.
+fn find_managed_section(
+    doc: &Document,
+    section_title: &str,
+    migrate_from: &[String],
+) -> Option<(usize, Vec<usize>)> {
+    let mut legacy_sections = Vec::new();
+    let mut first_idx = None;
+
+    for (i, block) in doc.blocks.iter().enumerate() {
+        if let Block::Heading { level: 2, .. } = block {
+            let text = block.heading_text().unwrap_or_default();
+            let text_lower = text.to_lowercase();
+
+            if text_lower == section_title.to_lowercase() {
+                // Found the canonical section
+                return Some((i, vec![]));
+            }
+
+            if migrate_from.iter().any(|m| m.to_lowercase() == text_lower) {
+                if first_idx.is_none() {
+                    first_idx = Some(i);
+                }
+                legacy_sections.push(i);
+            }
+        }
+    }
+
+    first_idx.map(|idx| (idx, legacy_sections))
 }
 
 /// Validate link constraints for a section.

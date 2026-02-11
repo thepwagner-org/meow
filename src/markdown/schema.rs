@@ -51,44 +51,128 @@ impl TypeDef {
 }
 
 /// Document structure definition.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(from = "StructureDefRaw")]
 pub struct StructureDef {
-    /// Title (H1) must match filename (without .md extension).
-    #[serde(default)]
-    pub title_from_filename: bool,
+    /// Title (H1) validation mode.
+    pub title: TitleMode,
     /// Frontmatter field definitions (order matters for serialization).
-    #[serde(default)]
     pub frontmatter: Vec<FrontmatterFieldDef>,
     /// Intro section (content between H1 and first H2).
-    #[serde(default)]
     pub intro: Option<SectionDef>,
-    /// Allowed sections in order. Sections not in this list are disallowed.
-    /// If empty, any sections are allowed.
-    #[serde(default)]
+    /// Section definitions. When `strict_sections` is true (the default),
+    /// sections not in this list are disallowed and ordering is enforced.
+    /// When false, only required/managed sections are checked.
     pub sections: Vec<SectionDef>,
+    /// Whether sections form a strict allowlist (default: true).
+    /// When false, unlisted sections are allowed and ordering is not enforced.
+    pub strict_sections: bool,
+    /// Validate all links in the document (not just section-scoped ones).
+    pub validate_all_links: bool,
+    /// Warn if file exceeds this size in bytes.
+    pub size_warning: Option<usize>,
+}
+
+impl Default for StructureDef {
+    fn default() -> Self {
+        Self {
+            title: TitleMode::None,
+            frontmatter: Vec::new(),
+            intro: None,
+            sections: Vec::new(),
+            strict_sections: true,
+            validate_all_links: false,
+            size_warning: None,
+        }
+    }
+}
+
+/// Raw deserialization struct for backward-compatible YAML parsing.
+///
+/// YAML schemas use `title_from_filename: true` which maps to `TitleMode::FromFilename`.
+#[derive(Deserialize, Default)]
+struct StructureDefRaw {
+    #[serde(default)]
+    title_from_filename: bool,
+    #[serde(default)]
+    frontmatter: Vec<FrontmatterFieldDef>,
+    #[serde(default)]
+    intro: Option<SectionDef>,
+    #[serde(default)]
+    sections: Vec<SectionDef>,
+}
+
+impl From<StructureDefRaw> for StructureDef {
+    fn from(raw: StructureDefRaw) -> Self {
+        let title = if raw.title_from_filename {
+            TitleMode::FromFilename
+        } else {
+            TitleMode::None
+        };
+        StructureDef {
+            title,
+            frontmatter: raw.frontmatter,
+            intro: raw.intro,
+            sections: raw.sections,
+            strict_sections: true,
+            validate_all_links: false,
+            size_warning: None,
+        }
+    }
 }
 
 /// Definition of a document section.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(from = "SectionDefRaw")]
 pub struct SectionDef {
     /// Section heading text (ignored for intro).
-    #[serde(default)]
     pub title: String,
     /// Description for LLM guidance.
-    #[serde(default)]
     pub description: Option<String>,
     /// Allow paragraph content (default: false, bullets required).
-    #[serde(default)]
     pub paragraph: bool,
     /// Whether this section is required.
-    #[serde(default)]
     pub required: bool,
     /// Template showing expected format (for LLM reference).
-    #[serde(default)]
     pub template: Option<String>,
     /// Link constraints for this section.
-    #[serde(default)]
     pub links: Option<LinksDef>,
+    /// Auto-managed section content (template + legacy migration).
+    pub managed_content: Option<ManagedContent>,
+    /// Required intro paragraph prefix (auto-inserted if missing).
+    pub intro_text: Option<String>,
+}
+
+/// Raw deserialization struct for SectionDef YAML compatibility.
+#[derive(Deserialize, Default)]
+struct SectionDefRaw {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    paragraph: bool,
+    #[serde(default)]
+    required: bool,
+    #[serde(default)]
+    template: Option<String>,
+    #[serde(default)]
+    links: Option<LinksDef>,
+}
+
+impl From<SectionDefRaw> for SectionDef {
+    fn from(raw: SectionDefRaw) -> Self {
+        SectionDef {
+            title: raw.title,
+            description: raw.description,
+            paragraph: raw.paragraph,
+            required: raw.required,
+            template: raw.template,
+            links: raw.links,
+            managed_content: None,
+            intro_text: None,
+        }
+    }
 }
 
 /// Link constraints for a section.
@@ -186,6 +270,35 @@ pub enum FieldType {
     Link,
     /// Array of items.
     List,
+}
+
+/// Title (H1) validation mode.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TitleMode {
+    /// No H1 validation.
+    #[default]
+    None,
+    /// H1 must match filename (without .md extension).
+    FromFilename,
+    /// H1 must match project name or frontmatter `name` field.
+    FromProject,
+    /// H1 must exist; if missing, auto-create with this text.
+    Fixed(String),
+    /// H1 must exist (unfixable error if missing).
+    RequiredAny,
+}
+
+/// Auto-managed section content definition.
+///
+/// When a section has managed content, the validator ensures the section
+/// matches the template and auto-fixes it if not. Custom content appended
+/// after the template is preserved.
+#[derive(Debug, Clone, Default)]
+pub struct ManagedContent {
+    /// Markdown template for the section (already substituted).
+    pub template: String,
+    /// Legacy section titles to migrate from.
+    pub migrate_from: Vec<String>,
 }
 
 /// A segment of a parsed template.
@@ -484,6 +597,122 @@ impl Schema {
     /// Get a type definition by name.
     pub fn get_type(&self, name: &str) -> Option<&TypeDef> {
         self.types.get(name)
+    }
+}
+
+// === Built-in type definitions ===
+
+/// Built-in TypeDef for README.md files.
+///
+/// - H1 matches project name or frontmatter `name` field
+/// - Requires `created` and `description` frontmatter fields
+/// - Validates all links in the document
+pub fn builtin_readme() -> TypeDef {
+    TypeDef {
+        description: Some("Project README".to_string()),
+        encrypted: false,
+        fields: indexmap::IndexMap::new(),
+        structure: StructureDef {
+            title: TitleMode::FromProject,
+            frontmatter: vec![
+                FrontmatterFieldDef {
+                    name: "created".to_string(),
+                    description: None,
+                    required: true,
+                },
+                FrontmatterFieldDef {
+                    name: "description".to_string(),
+                    description: None,
+                    required: true,
+                },
+            ],
+            validate_all_links: true,
+            ..Default::default()
+        },
+        index: None,
+    }
+}
+
+/// Built-in TypeDef for CLAUDE.md / AGENTS.md files.
+///
+/// - No frontmatter required
+/// - Warns if file exceeds 4000 bytes
+/// - Auto-manages "Related Documents" section with legacy migration
+pub fn builtin_claude(agent_file: &str) -> TypeDef {
+    let template = format!(
+        r#"## Related Documents
+
+- **journal/** - Daily notes in `YYYY-MM.md` files. Log design discussions, investigations, and decisions with `## YYYY-MM-DD` headings.
+- **ROADMAP.md** - Future possibilities and explicit non-goals. Update when brainstorming; don't track completed work here.
+- **{}** - How to work on the project: architecture, commands, lints. Keep concise.
+- **../knowledge/** - Personal knowledge base. Read `CLAUDE.md` there for structure; schemas in `.meow.d/`.
+"#,
+        agent_file
+    );
+
+    TypeDef {
+        description: Some("Agent instruction file".to_string()),
+        encrypted: false,
+        fields: indexmap::IndexMap::new(),
+        structure: StructureDef {
+            size_warning: Some(4000),
+            strict_sections: false,
+            sections: vec![SectionDef {
+                title: "Related Documents".to_string(),
+                paragraph: true,
+                managed_content: Some(ManagedContent {
+                    template,
+                    migrate_from: vec!["Journal".to_string(), "Roadmap".to_string()],
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        index: None,
+    }
+}
+
+/// Built-in TypeDef for ROADMAP.md files.
+///
+/// - H1 auto-created as "Roadmap" if missing
+/// - Requires "Non-Goals" section with intro paragraph
+/// - Other sections are allowed (non-strict)
+pub fn builtin_roadmap() -> TypeDef {
+    TypeDef {
+        description: Some("Project roadmap".to_string()),
+        encrypted: false,
+        fields: indexmap::IndexMap::new(),
+        structure: StructureDef {
+            title: TitleMode::Fixed("Roadmap".to_string()),
+            strict_sections: false,
+            sections: vec![SectionDef {
+                title: "Non-Goals".to_string(),
+                required: true,
+                paragraph: true,
+                intro_text: Some(
+                    "Explicitly out of scope to keep the project focused:".to_string(),
+                ),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        index: None,
+    }
+}
+
+/// Built-in TypeDef for command files (.claude/commands/*.md, .opencode/command/*.md).
+///
+/// - H1 must exist (unfixable error if missing)
+pub fn builtin_command() -> TypeDef {
+    TypeDef {
+        description: Some("Agent command file".to_string()),
+        encrypted: false,
+        fields: indexmap::IndexMap::new(),
+        structure: StructureDef {
+            title: TitleMode::RequiredAny,
+            ..Default::default()
+        },
+        index: None,
     }
 }
 

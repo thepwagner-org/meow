@@ -40,7 +40,7 @@ Currently `meow journal` is read-only. Could add entry creation.
 
 ## Non-Goals
 
-Explicitly out of scope to keep meow focused:
+Explicitly out of scope to keep the project focused:
 - **Life management** - Stays in MTD; meow is project navigation only
 - **Financial tracking** - MTD handles this
 - **Time tracking** - No Pomodoro, no time estimates

@@ -1,11 +1,10 @@
 //! README file parsing, validation, and formatting.
 //!
 //! README files live at `projects/{name}/README.md` with required YAML frontmatter.
+//! Validation is handled by the unified schema-driven validator via [`super::schema::builtin_readme`].
 
 pub use super::Frontmatter;
-use super::{
-    inlines_to_string, parse, validate_links, Block, Document, FormatContext, ValidationError,
-};
+use super::{custom, parse, schema, Document, FormatContext, ValidationError};
 use crate::{git, PROJECTS_DIR};
 use anyhow::{Context, Result};
 use git2::Repository;
@@ -16,61 +15,8 @@ use std::path::Path;
 ///
 /// Returns both unfixable errors and fixable issues (which will be auto-fixed).
 pub fn validate(doc: &Document, ctx: &FormatContext) -> Vec<ValidationError> {
-    let mut errors = Vec::new();
-
-    // Check frontmatter exists
-    match &doc.frontmatter {
-        None => {
-            errors.push(ValidationError::MissingFrontmatter { reason: None });
-        }
-        Some(fm) => {
-            if fm.created.is_none() {
-                errors.push(ValidationError::MissingRequiredField {
-                    line: 1,
-                    field: "created".to_string(),
-                });
-            }
-            if fm.description.is_none() {
-                errors.push(ValidationError::MissingRequiredField {
-                    line: 1,
-                    field: "description".to_string(),
-                });
-            }
-        }
-    }
-
-    // Check H1 matches expected title
-    let expected_title = doc
-        .frontmatter
-        .as_ref()
-        .and_then(|fm| fm.name.clone())
-        .unwrap_or_else(|| ctx.project.to_string());
-
-    let h1_title = doc.blocks.iter().find_map(|b| match b {
-        Block::Heading { level: 1, content } => Some(inlines_to_string(content)),
-        _ => None,
-    });
-
-    match h1_title {
-        None => {
-            // Fixable: will create H1
-            errors.push(ValidationError::MissingH1 {
-                expected: expected_title,
-            });
-        }
-        Some(title) if title != expected_title => {
-            // Fixable: will update H1
-            errors.push(ValidationError::H1Mismatch {
-                expected: expected_title,
-            });
-        }
-        _ => {}
-    }
-
-    // Validate links
-    errors.extend(validate_links(doc, ctx));
-
-    errors
+    let type_def = schema::builtin_readme();
+    custom::validate_builtin(doc, ctx, &type_def)
 }
 
 /// Parse a README file from a path.
