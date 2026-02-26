@@ -699,13 +699,28 @@ pub fn serialize_with_field_order(doc: &Document, field_order: Option<&[&str]>) 
                 output.push_str(&format!("created: {}\n", created.format("%Y-%m-%d")));
             }
             if let Some(description) = &fm.description {
-                output.push_str(&format!("description: {description}\n"));
+                serialize_yaml_field(
+                    &mut output,
+                    "description",
+                    &serde_yaml::Value::String(description.clone()),
+                    0,
+                );
             }
             if let Some(name) = &fm.name {
-                output.push_str(&format!("name: {name}\n"));
+                serialize_yaml_field(
+                    &mut output,
+                    "name",
+                    &serde_yaml::Value::String(name.clone()),
+                    0,
+                );
             }
             if let Some(doc_type) = &fm.doc_type {
-                output.push_str(&format!("type: {doc_type}\n"));
+                serialize_yaml_field(
+                    &mut output,
+                    "type",
+                    &serde_yaml::Value::String(doc_type.clone()),
+                    0,
+                );
             }
             // Preserve encrypt config (for README files)
             if let Some(ref encrypt) = fm.encrypt {

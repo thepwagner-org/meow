@@ -1,6 +1,6 @@
 # meow Roadmap
 
-This document explores future possibilities for meow. For current implementation and development guidelines, see [CLAUDE.md](CLAUDE.md).
+This document explores future possibilities for meow. For current implementation and development guidelines, see [AGENTS.md](AGENTS.md).
 
 ## Shell Support
 
@@ -28,7 +28,7 @@ Currently `meow journal` is read-only. Could add entry creation.
 
 ## Project Templates
 
-`meow add --create` generates basic boilerplate (README, CLAUDE.md, shell.nix, .envrc). Could support language-specific templates.
+`meow add --create` generates basic boilerplate (README, AGENTS.md, shell.nix, .envrc). Could support language-specific templates.
 **Possible approaches:**
 - `meow add --create --template rust` for Cargo.toml, src/
 - `meow add --create --template go` for go.mod
@@ -47,8 +47,8 @@ Explicitly out of scope to keep the project focused:
 - **Task prioritization** - No kanban, no project states
 - **Collaboration features** - Single-user tool
 - **GUI** - CLI-first, shell integration
-- **Note types beyond project metadata** - README, CLAUDE, journal, ROADMAP only
+- **Note types beyond project metadata** - README, AGENTS, journal, ROADMAP only
 
 ## See Also
 
-- [CLAUDE.md](CLAUDE.md) - Development guidelines and architecture
+- [AGENTS.md](AGENTS.md) - Development guidelines and architecture

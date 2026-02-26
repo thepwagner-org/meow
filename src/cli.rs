@@ -106,6 +106,25 @@ pub enum Command {
 
     /// Start Language Server Protocol server (diagnostics for markdown files)
     Lsp,
+
+    /// Start or manage the opencode web proxy
+    Web {
+        /// Project name or fuzzy query (omit to use interactive picker)
+        query: Option<String>,
+        #[command(subcommand)]
+        command: Option<WebCommand>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WebCommand {
+    /// List active opencode web sessions
+    List,
+    /// Stop a project's opencode web instance
+    Stop {
+        /// Project name (omit to use interactive picker)
+        query: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]

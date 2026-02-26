@@ -6,11 +6,31 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, warn};
 
-use crate::cli::{FmtArgs, JournalArgs, MirrorCommand, PruneArgs};
+use crate::cli::{FmtArgs, JournalArgs, MirrorCommand, PruneArgs, WebCommand};
 use crate::markdown::{
     self, claude, is_encrypted, parse, parse_encrypted, readme, serialize, FormatContext,
 };
-use crate::{git, mirror, picker, sparse, PROJECTS_DIR};
+use crate::{git, github, mirror, picker, sparse, web, PROJECTS_DIR};
+
+/// Call the running proxy's management API. Returns None if no proxy is running.
+async fn proxy_api_get(port: u16, path: &str) -> Option<reqwest::Response> {
+    let url = format!("http://127.0.0.1:{}/api/v1/{}", port, path);
+    reqwest::get(&url).await.ok()
+}
+
+async fn proxy_api_post(
+    port: u16,
+    path: &str,
+    body: serde_json::Value,
+) -> Option<reqwest::Response> {
+    let client = reqwest::Client::new();
+    client
+        .post(format!("http://127.0.0.1:{}/api/v1/{}", port, path))
+        .json(&body)
+        .send()
+        .await
+        .ok()
+}
 
 pub fn validate_project_name(name: &str) -> Result<()> {
     if name.is_empty() {
@@ -30,15 +50,29 @@ fn format_date(date: Option<NaiveDate>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-struct ProjectInfo {
-    name: String,
-    description: String,
-    created: Option<NaiveDate>,
-    updated: Option<NaiveDate>,
-    focused: bool,
+#[derive(Debug)]
+pub struct ProjectInfo {
+    pub name: String,
+    pub description: String,
+    pub created: Option<NaiveDate>,
+    pub updated: Option<NaiveDate>,
+    pub focused: bool,
 }
 
-fn gather_project_info(
+impl ProjectInfo {
+    /// Fallback when git metadata is unavailable.
+    pub fn name_only(name: String) -> Self {
+        Self {
+            name,
+            description: String::new(),
+            created: None,
+            updated: None,
+            focused: false,
+        }
+    }
+}
+
+pub fn gather_project_info(
     repo: &Repository,
     root: &Path,
     projects: &[String],
@@ -185,19 +219,7 @@ pub fn cmd_cd(
         bail!("No projects found");
     }
 
-    let selected = match query {
-        Some(q) => {
-            let matches = picker::fuzzy_match(&projects, &q);
-            if matches.len() == 1 {
-                Some(matches[0].clone())
-            } else if matches.is_empty() {
-                picker::pick(projects, use_color)?
-            } else {
-                picker::pick(matches, use_color)?
-            }
-        }
-        None => picker::pick(projects, use_color)?,
-    };
+    let selected = picker::fuzzy_pick(projects, query.as_deref(), use_color)?;
 
     if let Some(ref project) = selected {
         sparse::add_project(root, project)?;
@@ -220,7 +242,7 @@ pub fn cmd_init(shell: &str) -> Result<String> {
         r#"function meow
   set -l __meow_bin "{bin}"
   switch $argv[1]
-    case list ls rm drop init fmt journal zellij z prune decrypt pull mirror lsp --help -h --version -V
+    case list ls rm drop init fmt journal zellij z prune decrypt pull mirror lsp web --help -h --version -V
       $__meow_bin $argv
     case add cd
       set -l result ($__meow_bin $argv)
@@ -239,6 +261,10 @@ end
 
 function mz
   meow zellij $argv
+end
+
+function mw
+  meow web $argv
 end"#
     ))
 }
@@ -638,19 +664,8 @@ pub fn cmd_zellij(
         bail!("No projects currently focused");
     }
 
-    let selected = match query {
-        Some(q) => {
-            let matches = picker::fuzzy_match(&focused, &q);
-            match matches.len() {
-                1 => Some(matches[0].clone()),
-                0 => picker::pick(focused, use_color)?,
-                _ => picker::pick(matches, use_color)?,
-            }
-        }
-        None => picker::pick(focused, use_color)?,
-    };
-
-    let project = selected.context("No project selected")?;
+    let project =
+        picker::fuzzy_pick(focused, query.as_deref(), use_color)?.context("No project selected")?;
 
     // Determine worktree mode:
     // - branch_parts non-empty → worktree with kebab-cased branch name
@@ -874,8 +889,8 @@ fn cmd_mirror_status(root: &Path, use_color: bool) -> Result<()> {
 
 fn render_mirror_table(statuses: &[mirror::MirrorStatus]) -> String {
     let mut md = String::new();
-    md.push_str("| Project | Remote | Public | Private |\n");
-    md.push_str("|:--------|:-------|:-------|:--------|\n");
+    md.push_str("| Project | Remote | Public | Private | Alerts |\n");
+    md.push_str("|:--------|:-------|:-------|:--------|:-------|\n");
 
     for s in statuses {
         let public = s.public_commit.as_ref().map(|c| &c[..7]).unwrap_or("?");
@@ -886,9 +901,11 @@ fn render_mirror_table(statuses: &[mirror::MirrorStatus]) -> String {
             None => format!("{} (+?)", &s.private_commit[..7]),
         };
 
+        let alerts = github::format_alerts(&s.dependabot_alerts);
+
         md.push_str(&format!(
-            "| {} | {}/{} | {} | {} |\n",
-            s.project, s.config.org, s.config.repo, public, private
+            "| {} | {}/{} | {} | {} | {} |\n",
+            s.project, s.config.org, s.config.repo, public, private, alerts
         ));
     }
 
@@ -972,6 +989,240 @@ fn cmd_mirror_diff(root: &Path, project: Option<String>, no_scan: bool) -> Resul
     }
 
     Ok(None)
+}
+
+pub fn cmd_web(
+    _repo: &git2::Repository,
+    root: &Path,
+    query: Option<String>,
+    command: Option<WebCommand>,
+    use_color: bool,
+) -> Result<Option<u8>> {
+    let runtime = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+
+    match command {
+        Some(WebCommand::List) => {
+            runtime.block_on(async {
+                match web::running_proxy_port().await {
+                    None => info!("No meow web proxy running"),
+                    Some(port) => {
+                        let sessions: Vec<web::SessionInfo> = proxy_api_get(port, "sessions")
+                            .await
+                            .context("Failed to reach proxy")?
+                            .json()
+                            .await
+                            .context("Failed to parse sessions")?;
+                        if sessions.is_empty() {
+                            info!("No active sessions");
+                        } else {
+                            #[allow(clippy::print_stdout)]
+                            for s in &sessions {
+                                println!("{} (port {})", s.project, s.port);
+                            }
+                        }
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
+            Ok(None)
+        }
+
+        Some(WebCommand::Stop { query: stop_query }) => {
+            let focused = sparse::get_focused_projects(root)?;
+            if focused.is_empty() {
+                bail!("No projects currently focused");
+            }
+            let project = resolve_project(stop_query, focused, use_color)?;
+            runtime.block_on(async {
+                let port = web::running_proxy_port()
+                    .await
+                    .context("No meow web proxy running")?;
+                let resp = proxy_api_post(port, "stop", serde_json::json!({"project": project}))
+                    .await
+                    .context("Failed to reach proxy")?;
+                if resp.status().is_success() {
+                    info!("Stopped '{}'", project);
+                } else {
+                    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                    bail!("{}", body["error"].as_str().unwrap_or("unknown error"));
+                }
+                Ok(())
+            })?;
+            Ok(None)
+        }
+
+        None => {
+            let web_config = crate::config::Config::load()?.web;
+
+            // No query and no subcommand → open the home landing page
+            if query.is_none() {
+                let url = home_url(&web_config);
+                let existing_proxy = runtime.block_on(web::running_proxy_port());
+                if let Some(_port) = existing_proxy {
+                    open_chrome(&url);
+                } else {
+                    // No proxy running - we are the server.
+                    // Start with a dummy project that will never be used before the
+                    // browser opens; the landing page handles everything from there.
+                    info!("Starting meow web proxy");
+                    let dummy_project = String::new();
+                    let dummy_path = root.to_path_buf();
+                    runtime.block_on(async {
+                        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+                        let server_task = tokio::spawn(web::run_server(
+                            web_config,
+                            dummy_project,
+                            dummy_path,
+                            root.to_path_buf(),
+                            Some(ready_tx),
+                        ));
+                        let _ = ready_rx.await;
+                        open_chrome(&url);
+                        server_task.await.context("server task panicked")??;
+                        Ok::<(), anyhow::Error>(())
+                    })?;
+                }
+                return Ok(None);
+            }
+
+            let focused = sparse::get_focused_projects(root)?;
+            if focused.is_empty() {
+                bail!("No projects currently focused");
+            }
+            let project = resolve_project(query, focused, use_color)?;
+            let project_path = root.join(crate::PROJECTS_DIR).join(&project);
+            let project_url = project_url(&web_config, &project);
+
+            let existing_proxy = runtime.block_on(web::running_proxy_port());
+
+            if let Some(port) = existing_proxy {
+                // Proxy already running - add project and open browser, then exit
+                runtime.block_on(async {
+                    let resp = proxy_api_post(
+                        port,
+                        "add",
+                        serde_json::json!({
+                            "project": project,
+                            "path": project_path.display().to_string(),
+                        }),
+                    )
+                    .await
+                    .context("Failed to reach proxy")?;
+                    if resp.status().is_success() {
+                        info!("Added '{}' to running proxy", project);
+                    } else {
+                        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                        bail!("{}", body["error"].as_str().unwrap_or("unknown error"));
+                    }
+                    Ok::<(), anyhow::Error>(())
+                })?;
+                open_chrome(&project_url);
+            } else {
+                // No proxy running - we are the server.
+                // Start the server, wait until it's ready, then open the browser.
+                info!("Starting meow web proxy for '{}'", project);
+                runtime.block_on(async {
+                    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+                    let server_task = tokio::spawn(web::run_server(
+                        web_config,
+                        project.clone(),
+                        project_path.clone(),
+                        root.to_path_buf(),
+                        Some(ready_tx),
+                    ));
+                    // Wait for the server to signal it's listening before opening browser
+                    let _ = ready_rx.await;
+                    open_chrome(&project_url);
+                    // Now block until the server exits
+                    server_task.await.context("server task panicked")??;
+                    Ok::<(), anyhow::Error>(())
+                })?;
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// Pick the "primary" host for URL construction: prefer TLS hosts, otherwise
+/// use the first configured host.
+fn primary_host(web_config: &crate::config::WebConfig) -> &crate::config::HostConfig {
+    web_config
+        .tls_hosts()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| &web_config.hosts[0])
+}
+
+/// Build the URL for the landing page on the meow web proxy.
+fn home_url(web_config: &crate::config::WebConfig) -> String {
+    let hc = primary_host(web_config);
+    let tls = hc.tls_enabled();
+    let scheme = if tls { "https" } else { "http" };
+    let port = if tls {
+        web_config.port
+    } else {
+        web_config.http_port
+    };
+    let port_suffix = match (tls, port) {
+        (true, 443) | (false, 80) => String::new(),
+        (_, p) => format!(":{}", p),
+    };
+    format!("{}://home.{}{}/", scheme, hc.hostname, port_suffix)
+}
+
+fn project_url(web_config: &crate::config::WebConfig, project: &str) -> String {
+    let hc = primary_host(web_config);
+    let tls = hc.tls_enabled();
+    let scheme = if tls { "https" } else { "http" };
+    let port = if tls {
+        web_config.port
+    } else {
+        web_config.http_port
+    };
+    let port_suffix = match (tls, port) {
+        (true, 443) | (false, 80) => String::new(),
+        (_, p) => format!(":{}", p),
+    };
+    format!("{}://{}.{}{}/", scheme, project, hc.hostname, port_suffix)
+}
+
+/// Open a URL in Chrome Beta if available, falling back to xdg-open.
+/// When running inside opencode (OPENCODE=1), prints a message for the
+/// model instead of attempting to launch a browser.
+fn open_chrome(url: &str) {
+    if std::env::var("OPENCODE").is_ok() {
+        #[allow(clippy::print_stdout)]
+        {
+            println!("Session open at {}", url);
+        }
+        return;
+    }
+
+    // Try macOS `open -a "Google Chrome Beta"` first
+    if cfg!(target_os = "macos") {
+        let status = Command::new("open")
+            .args(["-a", "Google Chrome Beta", url])
+            .status();
+        match status {
+            Ok(s) if s.success() => return,
+            _ => {} // fall through to xdg-open
+        }
+    }
+
+    // Try xdg-open (Linux / fallback)
+    if let Err(e) = Command::new("xdg-open").arg(url).status() {
+        warn!("Failed to open browser: {}", e);
+    }
+}
+
+/// Resolve a project from an optional fuzzy query + list of candidates.
+/// Exact matches are returned immediately without showing the picker.
+fn resolve_project(
+    query: Option<String>,
+    candidates: Vec<String>,
+    use_color: bool,
+) -> Result<String> {
+    picker::fuzzy_pick(candidates, query.as_deref(), use_color)?.context("No project selected")
 }
 
 /// Run trufflehog secret scan on the mirror directory.

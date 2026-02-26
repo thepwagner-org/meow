@@ -645,7 +645,7 @@ pub fn builtin_claude(agent_file: &str) -> TypeDef {
 - **journal/** - Daily notes in `YYYY-MM.md` files. Log design discussions, investigations, and decisions with `## YYYY-MM-DD` headings.
 - **ROADMAP.md** - Future possibilities and explicit non-goals. Update when brainstorming; don't track completed work here.
 - **{}** - How to work on the project: architecture, commands, lints. Keep concise.
-- **../knowledge/** - Personal knowledge base. Read `CLAUDE.md` there for structure; schemas in `.meow.d/`.
+- **../knowledge/** - Personal knowledge base. Read `AGENTS.md` there for structure; schemas in `.meow.d/`.
 "#,
         agent_file
     );
@@ -710,6 +710,39 @@ pub fn builtin_command() -> TypeDef {
         fields: indexmap::IndexMap::new(),
         structure: StructureDef {
             title: TitleMode::RequiredAny,
+            ..Default::default()
+        },
+        index: None,
+    }
+}
+
+/// Built-in TypeDef for skill files (.opencode/skills/*/SKILL.md, .claude/skills/*/SKILL.md).
+///
+/// - No H1 (skill files start at H2)
+/// - Requires `name` and `description` frontmatter fields
+/// - Non-strict sections (skill body structure varies)
+pub fn builtin_skill() -> TypeDef {
+    TypeDef {
+        description: Some("Agent skill file".to_string()),
+        encrypted: false,
+        fields: indexmap::IndexMap::new(),
+        structure: StructureDef {
+            title: TitleMode::None,
+            frontmatter: vec![
+                FrontmatterFieldDef {
+                    name: "name".to_string(),
+                    description: Some(
+                        "Skill identifier (kebab-case, must match directory name)".to_string(),
+                    ),
+                    required: true,
+                },
+                FrontmatterFieldDef {
+                    name: "description".to_string(),
+                    description: Some("When to load this skill".to_string()),
+                    required: true,
+                },
+            ],
+            strict_sections: false,
             ..Default::default()
         },
         index: None,

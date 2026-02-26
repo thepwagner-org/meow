@@ -4,6 +4,7 @@
 //! for review and manual push.
 
 use crate::config;
+use crate::github;
 use crate::markdown::{parse, Frontmatter};
 use crate::PROJECTS_DIR;
 use anyhow::{bail, Context, Result};
@@ -442,13 +443,22 @@ pub struct MirrorStatus {
     pub private_commit: String,
     /// Number of commits between public and private (None if public unknown)
     pub commits_ahead: Option<usize>,
+    /// Open Dependabot alerts on the public repo (None if `gh` unavailable)
+    pub dependabot_alerts: Option<Vec<github::DependabotAlert>>,
 }
 
 /// Get status for all mirrored projects.
 pub fn get_all_status(root: &Path) -> Result<Vec<MirrorStatus>> {
     let projects = find_mirrored_projects(root)?;
-    let mut statuses = Vec::new();
 
+    // Batch-fetch dependabot alerts for all repos in one GraphQL query
+    let repos: Vec<(String, String)> = projects
+        .iter()
+        .map(|(_, c)| (c.org.clone(), c.repo.clone()))
+        .collect();
+    let alerts_map = github::fetch_dependabot_alerts(&repos);
+
+    let mut statuses = Vec::new();
     for (project, config) in projects {
         let mirror = mirror_path(&config.org, &config.repo)?;
         let public_commit = if mirror.exists() {
@@ -461,12 +471,18 @@ pub fn get_all_status(root: &Path) -> Result<Vec<MirrorStatus>> {
             .as_ref()
             .and_then(|pub_c| count_project_commits(root, &project, pub_c, &private_commit));
 
+        let dependabot_alerts = alerts_map
+            .as_ref()
+            .and_then(|m| m.get(&(config.org.clone(), config.repo.clone())))
+            .cloned();
+
         statuses.push(MirrorStatus {
             project,
             config: config.clone(),
             public_commit,
             private_commit,
             commits_ahead,
+            dependabot_alerts,
         });
     }
 

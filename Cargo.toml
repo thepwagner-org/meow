@@ -49,6 +49,19 @@ fuzzy-matcher = "0.3"
 is-terminal = "0.4"
 lsp-server = "0.7"
 lsp-types = "0.97"
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-no-provider"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+bytes = "1"
 
 [dev-dependencies]
 tempfile = "3"

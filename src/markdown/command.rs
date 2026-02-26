@@ -1,4 +1,4 @@
-//! Claude/opencode command file validation and formatting.
+//! Agent command file validation and formatting.
 //!
 //! Command files (`.claude/commands/*.md`, `.opencode/command/*.md`) define custom
 //! slash commands. Each command file should have an H1 title.
@@ -26,21 +26,21 @@ mod tests {
     fn test_matches_claude_command() {
         assert!(matches!(
             FileType::detect(Path::new(".claude/commands/shipit.md"), None),
-            Some(FileType::ClaudeCommand)
+            Some(FileType::AgentCommand)
         ));
         assert!(matches!(
             FileType::detect(Path::new("/some/path/.claude/commands/test.md"), None),
-            Some(FileType::ClaudeCommand)
+            Some(FileType::AgentCommand)
         ));
         // Not a command file
         assert!(!matches!(
             FileType::detect(Path::new(".claude/settings.json"), None),
-            Some(FileType::ClaudeCommand)
+            Some(FileType::AgentCommand)
         ));
         // Commands must be in .claude/commands/
         assert!(!matches!(
             FileType::detect(Path::new(".claude/shipit.md"), None),
-            Some(FileType::ClaudeCommand)
+            Some(FileType::AgentCommand)
         ));
     }
 
@@ -49,25 +49,25 @@ mod tests {
         // .opencode/command/ (singular)
         assert!(matches!(
             FileType::detect(Path::new(".opencode/command/shipit.md"), None),
-            Some(FileType::ClaudeCommand)
+            Some(FileType::AgentCommand)
         ));
         assert!(matches!(
             FileType::detect(Path::new("/some/path/.opencode/command/test.md"), None),
-            Some(FileType::ClaudeCommand)
+            Some(FileType::AgentCommand)
         ));
         // Not a command file
         assert!(!matches!(
             FileType::detect(Path::new(".opencode/settings.json"), None),
-            Some(FileType::ClaudeCommand)
+            Some(FileType::AgentCommand)
         ));
         // Commands must be in .opencode/command/ (not commands plural)
         assert!(!matches!(
             FileType::detect(Path::new(".opencode/commands/shipit.md"), None),
-            Some(FileType::ClaudeCommand)
+            Some(FileType::AgentCommand)
         ));
         assert!(!matches!(
             FileType::detect(Path::new(".opencode/shipit.md"), None),
-            Some(FileType::ClaudeCommand)
+            Some(FileType::AgentCommand)
         ));
     }
 

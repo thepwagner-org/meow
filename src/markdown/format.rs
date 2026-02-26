@@ -240,7 +240,8 @@ fn determine_should_encrypt(file_type: &FileType, config: &ProjectEncryptConfig)
         FileType::Agents => config.should_encrypt("agents"),
         FileType::Claude => config.should_encrypt("claude"),
         FileType::Roadmap => config.should_encrypt("roadmap"),
-        FileType::ClaudeCommand => false, // Never encrypt claude commands
+        FileType::AgentCommand => false, // Never encrypt commands
+        FileType::AgentSkill => false,   // Never encrypt skill files
         FileType::Custom { schema, type_name } => {
             // Check schema TypeDef for encrypted flag
             schema.get_type(type_name).is_some_and(|td| td.encrypted)

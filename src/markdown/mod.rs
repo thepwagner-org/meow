@@ -8,6 +8,7 @@ mod custom;
 mod format;
 mod parse;
 pub mod schema;
+mod skill;
 mod style;
 
 pub mod claude;
@@ -522,7 +523,9 @@ pub enum FileType {
     Agents,
     /// CLAUDE.md - agent instruction file for Claude Code (fallback).
     Claude,
-    ClaudeCommand,
+    AgentCommand,
+    /// Skill file (.opencode/skills/*/SKILL.md, .claude/skills/*/SKILL.md).
+    AgentSkill,
     Journal,
     Roadmap,
     /// Schema-driven document type.
@@ -576,7 +579,24 @@ impl FileType {
                 let is_opencode_cmd = gp_name == Some(OsStr::new(".opencode"))
                     && parent_name == Some(OsStr::new("command"));
                 if is_claude_cmd || is_opencode_cmd {
-                    return Some(FileType::ClaudeCommand);
+                    return Some(FileType::AgentCommand);
+                }
+            }
+        }
+        // Skill file: .opencode/skills/*/SKILL.md or .claude/skills/*/SKILL.md
+        if filename == OsStr::new("SKILL.md") {
+            if let Some(parent) = path.parent() {
+                if let Some(grandparent) = parent.parent() {
+                    if let Some(great_grandparent) = grandparent.parent() {
+                        let gp_name = grandparent.file_name();
+                        let ggp_name = great_grandparent.file_name();
+                        if gp_name == Some(OsStr::new("skills"))
+                            && (ggp_name == Some(OsStr::new(".opencode"))
+                                || ggp_name == Some(OsStr::new(".claude")))
+                        {
+                            return Some(FileType::AgentSkill);
+                        }
+                    }
                 }
             }
         }
@@ -617,7 +637,8 @@ impl FileType {
             FileType::Readme => readme::validate(doc, ctx),
             FileType::Agents => claude::validate(doc, ctx, "AGENTS.md"),
             FileType::Claude => claude::validate(doc, ctx, "CLAUDE.md"),
-            FileType::ClaudeCommand => command::validate(doc, ctx),
+            FileType::AgentCommand => command::validate(doc, ctx),
+            FileType::AgentSkill => skill::validate(doc, ctx),
             FileType::Journal => journal::validate(doc, ctx),
             FileType::Roadmap => roadmap::validate(doc, ctx),
             FileType::Custom { schema, type_name } => custom::validate(doc, ctx, schema, type_name),

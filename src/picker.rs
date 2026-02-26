@@ -59,6 +59,32 @@ pub fn pick(items: Vec<String>, use_color: bool) -> Result<Option<String>> {
     Ok(result)
 }
 
+/// Fuzzy-pick from candidates with an optional query.
+/// - Exact match bypasses the picker immediately
+/// - Single fuzzy match is auto-selected
+/// - Multiple matches show the picker
+/// - No query shows the full picker
+pub fn fuzzy_pick(
+    candidates: Vec<String>,
+    query: Option<&str>,
+    use_color: bool,
+) -> Result<Option<String>> {
+    match query {
+        Some(q) => {
+            if candidates.iter().any(|c| c == q) {
+                return Ok(Some(q.to_string()));
+            }
+            let matches = fuzzy_match(&candidates, q);
+            match matches.len() {
+                1 => Ok(Some(matches[0].clone())),
+                0 => pick(candidates, use_color),
+                _ => pick(matches, use_color),
+            }
+        }
+        None => pick(candidates, use_color),
+    }
+}
+
 /// Fuzzy match projects using skim algorithm (like fzf), sorted by score
 pub fn fuzzy_match(projects: &[String], query: &str) -> Vec<String> {
     let matcher = SkimMatcherV2::default();
@@ -117,5 +143,21 @@ mod tests {
         let matches = fuzzy_match(&projects, "nj");
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0], "nix-jail");
+    }
+
+    #[test]
+    fn test_fuzzy_pick_exact_match_wins() {
+        // "meow" should resolve immediately even though "meowser" also fuzzy-matches
+        let candidates = vec!["meow".to_string(), "meowser".to_string()];
+        let result = fuzzy_pick(candidates, Some("meow"), false).unwrap();
+        assert_eq!(result, Some("meow".to_string()));
+    }
+
+    #[test]
+    fn test_fuzzy_pick_single_fuzzy_match() {
+        // Only one fuzzy match → auto-select without picker
+        let candidates = vec!["alpha".to_string(), "beta".to_string()];
+        let result = fuzzy_pick(candidates, Some("alp"), false).unwrap();
+        assert_eq!(result, Some("alpha".to_string()));
     }
 }

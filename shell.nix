@@ -10,4 +10,6 @@ pkgs.mkShell {
     openssl
     git
   ];
+
+  RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
 }
