@@ -14,7 +14,7 @@ buildRustPackage {
       # Only wrap if binary exists (not during deps-only build)
       if [ -f $out/bin/meow ]; then
         wrapProgram $out/bin/meow \
-          --prefix PATH : ${pkgs.lib.makeBinPath [pkgs.trufflehog]}
+          --prefix PATH : ${pkgs.lib.makeBinPath [pkgs.gh pkgs.trufflehog]}
       fi
     '';
   };

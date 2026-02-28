@@ -141,6 +141,16 @@ pub enum MirrorCommand {
         #[arg(long)]
         no_scan: bool,
     },
+
+    /// Commit, push, and tag a prepared mirror
+    Push {
+        /// Project name (defaults to current directory's project)
+        project: Option<String>,
+
+        /// Commit message
+        #[arg(long, short)]
+        message: String,
+    },
 }
 
 #[derive(Args, Debug)]

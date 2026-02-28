@@ -6,6 +6,7 @@ This document explores future possibilities for meow. For current implementation
 
 Currently only fish is supported. Could expand to bash and zsh.
 **Possible approaches:**
+
 - `meow init bash` / `meow init zsh` with shell-specific wrapper functions
 - Detect shell from `$SHELL` environment variable
 - POSIX-compatible fallback for unsupported shells
@@ -18,6 +19,7 @@ Currently only fish is supported. Could expand to bash and zsh.
 
 Currently `meow journal` is read-only. Could add entry creation.
 **Possible approaches:**
+
 - `meow journal --add "entry text"` appends to today's section
 - `meow journal --edit` opens editor at current date
 - Auto-create month file and date heading if missing
@@ -30,6 +32,7 @@ Currently `meow journal` is read-only. Could add entry creation.
 
 `meow add --create` generates basic boilerplate (README, AGENTS.md, shell.nix, .envrc). Could support language-specific templates.
 **Possible approaches:**
+
 - `meow add --create --template rust` for Cargo.toml, src/
 - `meow add --create --template go` for go.mod
 - Templates as directories in `~/.config/meow/templates/`
@@ -41,6 +44,7 @@ Currently `meow journal` is read-only. Could add entry creation.
 ## Non-Goals
 
 Explicitly out of scope to keep the project focused:
+
 - **Life management** - Stays in MTD; meow is project navigation only
 - **Financial tracking** - MTD handles this
 - **Time tracking** - No Pomodoro, no time estimates

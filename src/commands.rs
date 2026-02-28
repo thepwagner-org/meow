@@ -869,6 +869,9 @@ pub fn cmd_mirror(root: &Path, command: MirrorCommand, use_color: bool) -> Resul
     match command {
         MirrorCommand::Status => cmd_mirror_status(root, use_color).map(|()| None),
         MirrorCommand::Diff { project, no_scan } => cmd_mirror_diff(root, project, no_scan),
+        MirrorCommand::Push { project, message } => {
+            cmd_mirror_push(root, project, &message).map(|()| None)
+        }
     }
 }
 
@@ -889,14 +892,26 @@ fn cmd_mirror_status(root: &Path, use_color: bool) -> Result<()> {
 
 fn render_mirror_table(statuses: &[mirror::MirrorStatus]) -> String {
     let mut md = String::new();
-    md.push_str("| Project | Remote | Public | Private | Alerts |\n");
-    md.push_str("|:--------|:-------|:-------|:--------|:-------|\n");
+    md.push_str("| Project | Version | Remote | Public | Private | Alerts |\n");
+    md.push_str("|:--------|:--------|:-------|:-------|:--------|:-------|\n");
 
     for s in statuses {
-        let public = s.public_commit.as_ref().map(|c| &c[..7]).unwrap_or("?");
+        let version = s.version.as_deref().unwrap_or("-");
+
+        let public = s
+            .sync_info
+            .as_ref()
+            .map(|si| &si.commit[..7])
+            .unwrap_or("?");
 
         let private = match s.commits_ahead {
+            Some(0) if s.templates_stale => {
+                format!("{} (stale templates)", &s.private_commit[..7])
+            }
             Some(0) => s.private_commit[..7].to_string(),
+            Some(n) if s.templates_stale => {
+                format!("{} (+{}, stale templates)", &s.private_commit[..7], n)
+            }
             Some(n) => format!("{} (+{})", &s.private_commit[..7], n),
             None => format!("{} (+?)", &s.private_commit[..7]),
         };
@@ -904,8 +919,8 @@ fn render_mirror_table(statuses: &[mirror::MirrorStatus]) -> String {
         let alerts = github::format_alerts(&s.dependabot_alerts);
 
         md.push_str(&format!(
-            "| {} | {}/{} | {} | {} | {} |\n",
-            s.project, s.config.org, s.config.repo, public, private, alerts
+            "| {} | {} | {}/{} | {} | {} | {} |\n",
+            s.project, version, s.config.org, s.config.repo, public, private, alerts
         ));
     }
 
@@ -947,13 +962,17 @@ fn cmd_mirror_diff(root: &Path, project: Option<String>, no_scan: bool) -> Resul
             )
         })?;
 
+    // Validate workflow names before doing any work
+    config.validate_workflows()?;
+
     // Ensure clone exists
     let mirror_path = mirror::ensure_clone(&config.org, &config.repo)?;
 
-    // Check if sync is needed
+    // Check if sync is needed (both commit and template hash must match)
     let latest_commit = mirror::get_latest_project_commit(root, &project)?;
-    if let Some(synced_commit) = mirror::get_synced_commit(&mirror_path) {
-        if synced_commit == latest_commit {
+    let expected_template_hash = mirror::compute_template_hash(&config.workflows);
+    if let Some(sync_info) = mirror::get_sync_info(&mirror_path) {
+        if sync_info.commit == latest_commit && sync_info.templates_hash == expected_template_hash {
             #[allow(clippy::print_stdout)]
             {
                 println!("{}", mirror_path.display());
@@ -969,6 +988,13 @@ fn cmd_mirror_diff(root: &Path, project: Option<String>, no_scan: bool) -> Resul
     // Sync filtered content to mirror
     let source_path = root.join(PROJECTS_DIR).join(&project);
     let file_count = mirror::sync_to_mirror(&source_path, &mirror_path, &config)?;
+
+    // Write sync info for shipit-mirror to use when creating the tag
+    let sync_info = mirror::SyncInfo {
+        commit: latest_commit.clone(),
+        templates_hash: expected_template_hash,
+    };
+    mirror::write_sync_info(&mirror_path, &sync_info)?;
 
     #[allow(clippy::print_stdout)]
     {
@@ -989,6 +1015,88 @@ fn cmd_mirror_diff(root: &Path, project: Option<String>, no_scan: bool) -> Resul
     }
 
     Ok(None)
+}
+
+fn cmd_mirror_push(root: &Path, project: Option<String>, message: &str) -> Result<()> {
+    let project = match project {
+        Some(p) => p,
+        None => git::detect_project_from_cwd(root)?
+            .context("Not in a project directory. Specify project name.")?,
+    };
+
+    // Load mirror config from README frontmatter
+    let readme_path = root.join(PROJECTS_DIR).join(&project).join("README.md");
+    if !readme_path.exists() {
+        bail!("Project '{}' has no README.md", project);
+    }
+
+    let content = fs::read_to_string(&readme_path)?;
+    let doc = parse(&content);
+    let config = doc
+        .frontmatter
+        .as_ref()
+        .and_then(mirror::MirrorConfig::from_frontmatter)
+        .with_context(|| {
+            format!(
+                "Project '{}' has no github field in README frontmatter",
+                project
+            )
+        })?;
+
+    let mirror_path = mirror::mirror_path(&config.org, &config.repo)?;
+    if !mirror_path.exists() {
+        bail!(
+            "Mirror clone not found at {}. Run 'meow mirror diff' first.",
+            mirror_path.display()
+        );
+    }
+
+    // Guard: ensure mirror diff was run (sync info file must exist)
+    let sync_info_path = mirror_path.join(".git").join("meow-sync-info");
+    if !sync_info_path.exists() {
+        bail!("No sync info found. Run 'meow mirror diff' before pushing.");
+    }
+
+    // Commit, push, and update tracking tag
+    let result = mirror::push_mirror(&mirror_path, message)?;
+
+    info!(
+        "Committed {} \"{}\"",
+        result.commit_hash.as_deref().unwrap_or("?"),
+        message
+    );
+    info!("Pushed to {}/{} main", config.org, config.repo);
+
+    if result.tracking_tag_updated {
+        info!("Updated tracking tag (monorepo-synced)");
+    } else if let Some(ref err) = result.tracking_tag_error {
+        warn!("Tracking tag failed: {}", err);
+    }
+
+    // Sync repo description from frontmatter
+    if let Some(desc) = doc
+        .frontmatter
+        .as_ref()
+        .and_then(|fm| fm.description.as_ref())
+    {
+        match mirror::sync_repo_description(&config.org, &config.repo, desc) {
+            Ok(()) => info!("Synced repo description"),
+            Err(e) => warn!("Description sync failed: {}", e),
+        }
+    }
+
+    // Version tagging
+    if let Some(version) = mirror::read_project_version(root, &project) {
+        match mirror::tag_version_if_needed(&mirror_path, &version) {
+            Ok(mirror::VersionTagResult::Created(tag)) => info!("Tagged {}", tag),
+            Ok(mirror::VersionTagResult::AlreadyExists(tag)) => {
+                info!("{} already tagged — skipped", tag)
+            }
+            Err(e) => warn!("Version tagging failed: {}", e),
+        }
+    }
+
+    Ok(())
 }
 
 pub fn cmd_web(
