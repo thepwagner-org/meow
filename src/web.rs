@@ -49,7 +49,7 @@ use tokio_tungstenite::tungstenite::Message as TungMsg;
 use tracing::{info, warn};
 
 use crate::commands::{gather_project_info, ProjectInfo};
-use crate::config::{data_dir, HostConfig, WebConfig};
+use crate::config::{data_dir, HostConfig, SandboxConfig, WebConfig};
 use crate::{git, sparse, PROJECTS_DIR};
 
 /// Sanitise a user-supplied worktree name to lowercase kebab-case.
@@ -145,6 +145,9 @@ struct OpenCodeProcess {
     started_at: u64,
     last_request: Arc<AtomicU64>,
     _child: Child,
+    /// Temp files for sandbox credential/policy configs. Held here so they
+    /// live as long as the session and are deleted when the session ends.
+    _sandbox_tempfiles: Vec<tempfile::NamedTempFile>,
 }
 
 fn epoch_secs() -> u64 {
@@ -168,7 +171,7 @@ struct ProxyState {
     hosts: Vec<HostConfig>,
     /// HTTPS port (only bound when at least one host has TLS configured).
     https_port: u16,
-    /// HTTP port (always bound; also used for HTTP→HTTPS redirects).
+    /// HTTP port (always used for HTTP→HTTPS redirects).
     http_port: u16,
     /// Repository root (parent of `projects/`).
     repo_root: PathBuf,
@@ -178,10 +181,18 @@ struct ProxyState {
     http_client: Client<hyper_util::client::legacy::connect::HttpConnector, Body>,
     /// Broadcast channel for session lifecycle events (SSE).
     events_tx: broadcast::Sender<SessionEvent>,
+    /// Nix-jail sandbox config. When `Some`, opencode is spawned inside a sandbox.
+    sandbox: Option<SandboxConfig>,
 }
 
 impl ProxyState {
-    fn new(hosts: Vec<HostConfig>, https_port: u16, http_port: u16, repo_root: PathBuf) -> Self {
+    fn new(
+        hosts: Vec<HostConfig>,
+        https_port: u16,
+        http_port: u16,
+        repo_root: PathBuf,
+        sandbox: Option<SandboxConfig>,
+    ) -> Self {
         let http_client = Client::builder(TokioExecutor::new()).build_http();
         let (events_tx, _) = broadcast::channel(64);
         Self {
@@ -193,6 +204,7 @@ impl ProxyState {
             asset_cache: RwLock::new(HashMap::new()),
             http_client,
             events_tx,
+            sandbox,
         }
     }
 
@@ -268,7 +280,13 @@ impl ProxyState {
                 return Ok(p.port);
             }
         }
-        let (child, port, password) = spawn_opencode(project, project_path).await?;
+        let (child, port, password, tempfiles) = spawn_opencode(
+            project,
+            project_path,
+            &self.repo_root,
+            self.sandbox.as_ref(),
+        )
+        .await?;
         info!(project, port, "spawned opencode serve");
         let now = epoch_secs();
         let mut sessions = self.sessions.write().await;
@@ -281,6 +299,7 @@ impl ProxyState {
                 started_at: now,
                 last_request: Arc::new(AtomicU64::new(now)),
                 _child: child,
+                _sandbox_tempfiles: tempfiles,
             })),
         );
         // Notify SSE subscribers about the new session.
@@ -446,7 +465,168 @@ fn cached_asset_response(asset: &CachedAsset) -> Response {
 
 // ── Spawn opencode serve ──────────────────────────────────────────────────────
 
-async fn spawn_opencode(project: &str, project_path: &Path) -> Result<(Child, u16, String)> {
+/// Default network policy TOML injected into the sandbox when no override is configured.
+///
+/// Matches `nix-jail/examples/network-policies/opencode-allow.toml`.
+const DEFAULT_SANDBOX_NETWORK_POLICY: &str = r#"
+[[rules]]
+action = "allow"
+credential = "anthropic"
+[rules.pattern]
+host = "api.anthropic.com"
+
+[[rules]]
+action = "allow"
+[rules.pattern]
+host = "console.anthropic.com"
+
+[[rules]]
+action = "allow"
+[rules.pattern]
+host = "registry.npmjs.org"
+
+[[rules]]
+action = "allow"
+[rules.pattern]
+host = "registry.bun.sh"
+
+[[rules]]
+action = "allow"
+[rules.pattern]
+host = "app.opencode.ai"
+
+[[rules]]
+action = "allow"
+[rules.pattern]
+host = "models.dev"
+"#;
+
+/// Script run inside the nix-jail sandbox to start opencode serve.
+const SANDBOX_SCRIPT: &str = r#"#!/usr/bin/env bash
+exec opencode serve --port 0 --hostname 127.0.0.1 --print-logs
+"#;
+
+/// Spawn opencode in a nix-jail sandbox via `nj exec` (submits to nixjaild daemon).
+///
+/// Returns `(child, port, password, tempfiles)`. The tempfiles must be kept
+/// alive as long as the session -- dropping them deletes the TOML/script files.
+///
+/// Unlike `nj run`, `nj exec` submits the job to the `nixjaild` daemon running
+/// as root, which handles network namespaces. This allows meow-web to run as an
+/// unprivileged systemd service without `CAP_NET_ADMIN` or `CAP_SYS_ADMIN`.
+async fn spawn_opencode_sandboxed(
+    project: &str,
+    project_path: &Path,
+    repo_root: &Path,
+    sandbox: &SandboxConfig,
+) -> Result<(Child, u16, String, Vec<tempfile::NamedTempFile>)> {
+    use std::io::Write as _;
+    use tokio::process::Command;
+
+    let mut tempfiles: Vec<tempfile::NamedTempFile> = Vec::new();
+
+    // Write the opencode launch script to a tempfile.
+    let script_path = {
+        let mut f = tempfile::NamedTempFile::new()
+            .context("Failed to create temp file for sandbox script")?;
+        f.write_all(SANDBOX_SCRIPT.as_bytes())
+            .context("Failed to write sandbox script")?;
+        let path = f.path().to_path_buf();
+        tempfiles.push(f);
+        path
+    };
+
+    // Write the network policy to a tempfile (unless the user configured an
+    // explicit path). Credentials are handled server-side by nixjaild/alice.
+    let policy_path: std::path::PathBuf = match &sandbox.network_policy {
+        Some(p) => p.clone(),
+        None => {
+            let mut f = tempfile::NamedTempFile::new()
+                .context("Failed to create temp file for sandbox network policy")?;
+            f.write_all(DEFAULT_SANDBOX_NETWORK_POLICY.as_bytes())
+                .context("Failed to write sandbox network policy")?;
+            let path = f.path().to_path_buf();
+            tempfiles.push(f);
+            path
+        }
+    };
+
+    // Derive the repo-relative project path for --path and --cwd.
+    // project_path is absolute; repo_root is the repo root. Strip the prefix
+    // to get e.g. "projects/meow".
+    let rel_project_path = project_path
+        .strip_prefix(repo_root)
+        .with_context(|| {
+            format!(
+                "project path {} is not inside repo root {}",
+                project_path.display(),
+                repo_root.display()
+            )
+        })?
+        .to_string_lossy()
+        .into_owned();
+
+    // Build the `nj exec` command. `nj exec` submits the job to nixjaild and
+    // then streams the job's stdout/stderr, so read_port_from_output still works.
+    let mut cmd = Command::new(&sandbox.nj_bin);
+
+    let _ = cmd.arg("exec");
+    let _ = cmd.arg("--server").arg(&sandbox.nix_jail_url);
+
+    // Point nixjaild at the local repo checkout (nixjaild runs on the same host).
+    let _ = cmd.arg("--repo").arg(repo_root);
+    let _ = cmd.arg("--path").arg(&rel_project_path);
+
+    // Set CWD to the project directory so opencode opens in the right place.
+    let _ = cmd.arg("--cwd").arg(&rel_project_path);
+
+    // Script to execute inside the sandbox.
+    let _ = cmd.arg("--script").arg(&script_path);
+
+    // Network policy (host allowlist + credential injection rules).
+    let _ = cmd.arg("--policy").arg(&policy_path);
+
+    // Language-specific network access for Rust projects.
+    if project_path.join("Cargo.toml").exists() {
+        let _ = cmd.arg("--allow-host").arg("crates.io");
+        let _ = cmd.arg("--allow-host").arg("index.crates.io");
+        let _ = cmd.arg("--allow-host").arg("static.crates.io");
+    }
+
+    // JIT runtime profile: bun requires JIT (JavaScript engine).
+    let _ = cmd.arg("--hardening-profile").arg("jit-runtime");
+
+    // Environment variables passed into the sandbox.
+    let _ = cmd.arg("-e").arg("OPENCODE_DISABLE_AUTOUPDATE=true");
+    let _ = cmd.arg("-e").arg("OPENCODE_DISABLE_LSP_DOWNLOAD=true");
+    let _ = cmd
+        .arg("-e")
+        .arg("OPENCODE_CONFIG_CONTENT={\"disabled_providers\":[\"opencode\"]}");
+
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("Failed to spawn nj exec (nix-jail client)")?;
+
+    let stdout = child.stdout.take().context("No stdout from nj exec")?;
+    let stderr = child.stderr.take().context("No stderr from nj exec")?;
+    let port = read_port_from_output(project, stdout, stderr).await?;
+
+    // Sandbox provides isolation; no per-process password needed.
+    Ok((child, port, String::new(), tempfiles))
+}
+
+async fn spawn_opencode(
+    project: &str,
+    project_path: &Path,
+    repo_root: &Path,
+    sandbox: Option<&SandboxConfig>,
+) -> Result<(Child, u16, String, Vec<tempfile::NamedTempFile>)> {
+    if let Some(s) = sandbox {
+        return spawn_opencode_sandboxed(project, project_path, repo_root, s).await;
+    }
+
     use tokio::process::Command;
 
     let password: String = if OPENCODE_AUTH {
@@ -522,10 +702,10 @@ async fn spawn_opencode(project: &str, project_path: &Path) -> Result<(Child, u1
     let stdout = child.stdout.take().context("No stdout from opencode")?;
     let stderr = child.stderr.take().context("No stderr from opencode")?;
     let port = read_port_from_output(project, stdout, stderr).await?;
-    Ok((child, port, password))
+    Ok((child, port, password, Vec::new()))
 }
 
-async fn read_port_from_output(
+pub(crate) async fn read_port_from_output(
     project: &str,
     stdout: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     stderr: impl tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -581,7 +761,7 @@ async fn read_port_from_output(
         .context("opencode serve exited before announcing port")
 }
 
-fn extract_port(line: &str) -> Option<u16> {
+pub(crate) fn extract_port(line: &str) -> Option<u16> {
     let re = regex::Regex::new(r":(\d{4,5})(?:[/\s]|$)").ok()?;
     let caps = re.captures(line)?;
     caps.get(1)?.as_str().parse().ok()
@@ -1914,6 +2094,7 @@ pub async fn run_server(
         web_config.port,
         web_config.http_port,
         repo_root,
+        web_config.sandbox.clone(),
     ));
 
     let _port = state.add_project(&project, &project_path).await?;

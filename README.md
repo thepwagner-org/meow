@@ -1,42 +1,98 @@
 # meow
 
-CLI tool for managing sparse-checkout in monorepos. Focus on the projects you're actively working on.
+CLI for navigating a monorepo of projects. If you're reading this on GitHub, it arrived here via `meow mirror push`.
 
-## Usage
+## Setup
+
+```bash
+# Add to fish config
+meow init fish | source
+```
+
+This gives you `m` for `meow`, `mz` for `meow zellij`, and `mw` for `meow web`. Any unrecognized subcommand becomes a fuzzy project jump — `meow foo` finds and `cd`s to the best match.
+
+## Sparse Checkout
 
 ```bash
 # List focused projects
 meow list
 
-# List all projects (focused marked with *)
+# List everything
 meow list --all
 
-# Add a project to focus
+# Focus on a project (and cd to it)
 meow add <project>
-
-# Remove a project from focus
-meow drop <project>
 
 # Create a new project with boilerplate
 meow add --create <project>
 
-# Format markdown files in current project
-meow fmt
+# Remove from focus
+meow rm <project>
+```
 
-# Read journal entries
-meow journal
-meow journal --days 7
-meow journal --git  # interleave with commits
+## Zellij Sessions
 
-# Open project in zellij tab
+```bash
+# Open project in a zellij tab
 meow z <project>
-meow z <project> feature-name  # in new worktree
 
-# Maintenance
-meow pull           # git pull
-meow prune          # clean up worktrees
-meow decrypt <file> # decrypt encrypted markdown
+# Open in a fresh worktree
+meow z <project> feature-name
 
-# Start LSP server (markdown diagnostics)
-meow lsp
+# Worktree with a timestamp branch
+meow z <project> -t
+
+# Clean up stale worktrees
+meow prune
+```
+
+Uses `.meow.d/layout.kdl` from the project if present, otherwise the `dev` layout.
+
+## OpenCode Web
+
+```bash
+# Open a project in the browser
+meow web <project>
+
+# List active sessions
+meow web list
+
+# Stop a session
+meow web stop <project>
+```
+
+Each project gets a subdomain on your hostname via a local proxy.
+
+## Journal
+
+```bash
+# Current project
+meow journal
+
+# Last 7 days
+meow journal --days 7
+
+# Interleave with git commits
+meow journal --git
+
+# All focused projects
+meow journal --all
+```
+
+## GitHub Mirrors
+
+How this README got here, probably.
+
+```bash
+# Check status across all mirrored projects
+meow mirror status
+
+# Prepare a mirror (sync + secret scan)
+meow mirror diff
+
+# Push to GitHub
+meow mirror push -m "sync changes"
+
+# Pull latest changes in the monorepo
+meow pull
 ```

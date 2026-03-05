@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use chrono::NaiveDate;
 use clap::{Args, Parser, Subcommand};
 
@@ -61,9 +59,6 @@ pub enum Command {
         shell: String,
     },
 
-    /// Format markdown files
-    Fmt(FmtArgs),
-
     /// Read project journal entries
     Journal(JournalArgs),
 
@@ -81,19 +76,16 @@ pub enum Command {
         /// Create a fresh git worktree with timestamp-based branch
         #[arg(short = 't', long, visible_aliases = ["wt", "tree"])]
         worktree: bool,
+        /// Start opencode in the new tab and send a free-form prompt
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Start opencode in the new tab and run a slash command (e.g. "shipit-mirror")
+        #[arg(long)]
+        command: Option<String>,
     },
 
     /// Prune stale git worktrees
     Prune(PruneArgs),
-
-    /// Decrypt an encrypted file
-    Decrypt {
-        /// File path to decrypt
-        file: PathBuf,
-        /// Decrypt in place (modify file)
-        #[arg(short, long)]
-        in_place: bool,
-    },
 
     /// Pull latest changes in the monorepo
     Pull,
@@ -104,13 +96,15 @@ pub enum Command {
         command: MirrorCommand,
     },
 
-    /// Start Language Server Protocol server (diagnostics for markdown files)
-    Lsp,
-
     /// Start or manage the opencode web proxy
     Web {
         /// Project name or fuzzy query (omit to use interactive picker)
         query: Option<String>,
+
+        /// Run opencode in nix-jail sandbox (--sandbox / --sandbox=false)
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        sandbox: Option<bool>,
+
         #[command(subcommand)]
         command: Option<WebCommand>,
     },
@@ -158,25 +152,6 @@ pub struct PruneArgs {
     /// Skip confirmation for dirty worktrees
     #[arg(short, long)]
     pub force: bool,
-}
-
-#[derive(Args, Debug)]
-pub struct FmtArgs {
-    /// Project name (defaults to current directory's project)
-    #[arg(conflicts_with = "all")]
-    pub project: Option<String>,
-
-    /// Format all active (focused) projects
-    #[arg(short = 'A', long)]
-    pub all: bool,
-
-    /// Skip encrypted files (don't decrypt/re-encrypt)
-    #[arg(long)]
-    pub skip_encrypted: bool,
-
-    /// Check if files are formatted without writing changes (exits non-zero if changes needed)
-    #[arg(long)]
-    pub check: bool,
 }
 
 #[derive(Args, Debug)]

@@ -73,6 +73,19 @@ struct HostConfigFile {
 ///       tls_key:  ~/.config/meow/key.pem
 /// ```
 #[derive(Debug, Deserialize, Default)]
+struct SandboxConfigFile {
+    enabled: Option<bool>,
+    nj_bin: Option<String>,
+    alice_bin: Option<String>,
+    sandbox_package: Option<String>,
+    credential_config: Option<String>,
+    network_policy: Option<String>,
+    #[serde(default)]
+    extra_packages: Vec<String>,
+    nix_jail_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct WebConfigFile {
     // Legacy single-host fields
     hostname: Option<String>,
@@ -83,6 +96,8 @@ struct WebConfigFile {
     bind: Option<String>,
     port: Option<u16>,
     http_port: Option<u16>,
+    #[serde(default)]
+    sandbox: SandboxConfigFile,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +126,45 @@ impl HostConfig {
     }
 }
 
+/// Nix-jail sandbox configuration for spawning opencode.
+///
+/// When enabled, `meow web` wraps opencode in `nj exec` (submitting to the
+/// `nixjaild` daemon) instead of spawning it directly. Credentials are injected
+/// by alice server-side; the direnv environment is not captured.
+///
+/// Example config.yaml:
+/// ```yaml
+/// web:
+///   sandbox:
+///     enabled: true
+///     nj_bin: ~/src/projects/nix-jail/target/debug/client
+///     alice_bin: ~/src/projects/alice/target/debug/alice
+///     sandbox_package: "/Users/pwagner/src#devShells.aarch64-darwin.sandbox"
+/// ```
+#[derive(Debug, Clone)]
+pub struct SandboxConfig {
+    /// Whether sandboxing is active. Defaults to false.
+    pub enabled: bool,
+    /// Path to the nix-jail client binary (`nj`).
+    pub nj_bin: PathBuf,
+    /// Path to the alice MITM proxy binary.
+    pub alice_bin: PathBuf,
+    /// Nix package or flake installable providing sandbox base tools (opencode,
+    /// zsh, coreutils, git). E.g. `"opencode"` for a plain nixpkgs name or
+    /// `"/Users/pwagner/src#devShells.aarch64-darwin.sandbox"` for a flake devShell.
+    pub sandbox_package: String,
+    /// Path to a credential TOML override. If absent, meow uses built-in defaults.
+    pub credential_config: Option<PathBuf>,
+    /// Path to a network policy TOML override. If absent, meow uses built-in defaults.
+    pub network_policy: Option<PathBuf>,
+    /// Additional nix packages to include in the sandbox.
+    pub extra_packages: Vec<String>,
+    /// gRPC URL of the nixjaild daemon.
+    /// Used as the `--server` argument when invoking `nj exec`.
+    /// Defaults to `"http://127.0.0.1:50051"`.
+    pub nix_jail_url: String,
+}
+
 /// Web proxy configuration.
 #[derive(Debug, Clone)]
 pub struct WebConfig {
@@ -122,6 +176,8 @@ pub struct WebConfig {
     pub port: u16,
     /// HTTP port (always bound).
     pub http_port: u16,
+    /// Nix-jail sandbox configuration. None when sandboxing is disabled.
+    pub sandbox: Option<SandboxConfig>,
 }
 
 impl WebConfig {
@@ -153,6 +209,7 @@ impl Default for WebConfig {
             bind: "0.0.0.0".to_string(),
             port: 3443,
             http_port: 3080,
+            sandbox: None,
         }
     }
 }
@@ -244,11 +301,61 @@ impl Config {
                 anyhow::bail!("web.hosts must not be empty");
             }
 
+            // Parse optional sandbox config.
+            let sandbox = if f.sandbox.enabled.unwrap_or(false) {
+                let nj_bin = f
+                    .sandbox
+                    .nj_bin
+                    .as_deref()
+                    .map(expand_tilde)
+                    .transpose()?
+                    .context("web.sandbox.nj_bin is required when sandbox is enabled")?;
+                let alice_bin = f
+                    .sandbox
+                    .alice_bin
+                    .as_deref()
+                    .map(expand_tilde)
+                    .transpose()?
+                    .context("web.sandbox.alice_bin is required when sandbox is enabled")?;
+                let sandbox_package = f
+                    .sandbox
+                    .sandbox_package
+                    .unwrap_or_else(|| "opencode".to_string());
+                let credential_config = f
+                    .sandbox
+                    .credential_config
+                    .as_deref()
+                    .map(expand_tilde)
+                    .transpose()?;
+                let network_policy = f
+                    .sandbox
+                    .network_policy
+                    .as_deref()
+                    .map(expand_tilde)
+                    .transpose()?;
+                Some(SandboxConfig {
+                    enabled: true,
+                    nj_bin,
+                    alice_bin,
+                    sandbox_package,
+                    credential_config,
+                    network_policy,
+                    extra_packages: f.sandbox.extra_packages,
+                    nix_jail_url: f
+                        .sandbox
+                        .nix_jail_url
+                        .unwrap_or_else(|| "http://127.0.0.1:50051".to_string()),
+                })
+            } else {
+                None
+            };
+
             WebConfig {
                 hosts,
                 bind: f.bind.unwrap_or(defaults.bind),
                 port: f.port.unwrap_or(defaults.port),
                 http_port: f.http_port.unwrap_or(defaults.http_port),
+                sandbox,
             }
         };
 

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use meow::cli::{Cli, Command};
-use meow::{color, commands, config, git, lsp};
+use meow::{color, commands, config, git};
 use std::io::Write;
 use std::process::ExitCode;
 use tracing::error;
@@ -12,35 +12,32 @@ fn main() -> ExitCode {
     // conflict with reqwest which uses rustls-tls-no-provider.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    // Skip tracing setup for LSP (uses stdio for protocol)
-    if !std::env::args().any(|a| a == "lsp") {
-        let is_web = std::env::args().any(|a| a == "web");
-        let log_file = if is_web { open_log_file() } else { None };
+    let is_web = std::env::args().any(|a| a == "web");
+    let log_file = if is_web { open_log_file() } else { None };
 
-        if let Some(file) = log_file {
-            let tee = TeeWriter {
-                stderr: std::io::stderr(),
-                file,
-            };
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("meow=info")),
-                )
-                .with_writer(std::sync::Mutex::new(tee))
-                .with_target(false)
-                .with_ansi(false)
-                .init();
-        } else {
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("meow=info")),
-                )
-                .with_writer(std::io::stderr)
-                .with_target(false)
-                .init();
-        }
+    if let Some(file) = log_file {
+        let tee = TeeWriter {
+            stderr: std::io::stderr(),
+            file,
+        };
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("meow=info")),
+            )
+            .with_writer(std::sync::Mutex::new(tee))
+            .with_target(false)
+            .with_ansi(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("meow=info")),
+            )
+            .with_writer(std::io::stderr)
+            .with_target(false)
+            .init();
     }
 
     match run() {
@@ -97,8 +94,6 @@ fn run() -> Result<Option<u8>> {
             Ok(None)
         }
 
-        Command::Fmt(args) => commands::cmd_fmt(&repo, &root, args).map(|()| None),
-
         Command::Journal(args) => {
             commands::cmd_journal(&repo, &root, args, use_color).map(|()| None)
         }
@@ -108,24 +103,31 @@ fn run() -> Result<Option<u8>> {
             branch_parts,
             layout,
             worktree,
-        } => commands::cmd_zellij(&root, query, branch_parts, &layout, worktree, use_color)
-            .map(|()| None),
+            prompt,
+            command,
+        } => commands::cmd_zellij(
+            &root,
+            query,
+            branch_parts,
+            &layout,
+            worktree,
+            prompt,
+            command,
+            use_color,
+        )
+        .map(|()| None),
 
         Command::Prune(args) => commands::cmd_prune(&root, args).map(|()| None),
-
-        Command::Decrypt { file, in_place } => {
-            commands::cmd_decrypt(&file, in_place).map(|()| None)
-        }
 
         Command::Pull => commands::cmd_pull(&root).map(|()| None),
 
         Command::Mirror { command } => commands::cmd_mirror(&root, command, use_color),
 
-        Command::Lsp => lsp::run().map(|()| None),
-
-        Command::Web { query, command } => {
-            commands::cmd_web(&repo, &root, query, command, use_color)
-        }
+        Command::Web {
+            query,
+            sandbox,
+            command,
+        } => commands::cmd_web(&repo, &root, query, command, sandbox, use_color),
     }
 }
 

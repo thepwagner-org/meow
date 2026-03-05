@@ -6,10 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, warn};
 
-use crate::cli::{FmtArgs, JournalArgs, MirrorCommand, PruneArgs, WebCommand};
-use crate::markdown::{
-    self, claude, is_encrypted, parse, parse_encrypted, readme, serialize, FormatContext,
-};
+use crate::cli::{JournalArgs, MirrorCommand, PruneArgs, WebCommand};
+use crate::markdown::{self, parse_frontmatter};
 use crate::{git, github, mirror, picker, sparse, web, PROJECTS_DIR};
 
 /// Call the running proxy's management API. Returns None if no proxy is running.
@@ -81,13 +79,15 @@ pub fn gather_project_info(
     projects
         .iter()
         .map(|name| {
-            let readme_doc = readme::load_readme(repo, root, name).ok();
-            let fm = readme_doc.as_ref().and_then(|d| d.frontmatter.as_ref());
+            let fm = markdown::load_readme_frontmatter(repo, root, name);
 
             Ok(ProjectInfo {
                 name: name.clone(),
-                description: fm.and_then(|f| f.description.clone()).unwrap_or_default(),
-                created: fm.and_then(|f| f.created),
+                description: fm
+                    .as_ref()
+                    .and_then(|f| f.description.clone())
+                    .unwrap_or_default(),
+                created: fm.as_ref().and_then(|f| f.created),
                 updated: git::get_project_updated(repo, name)?,
                 focused: focused.contains(name),
             })
@@ -242,7 +242,7 @@ pub fn cmd_init(shell: &str) -> Result<String> {
         r#"function meow
   set -l __meow_bin "{bin}"
   switch $argv[1]
-    case list ls rm drop init fmt journal zellij z prune decrypt pull mirror lsp web --help -h --version -V
+    case list ls rm drop init journal zellij z prune pull mirror web --help -h --version -V
       $__meow_bin $argv
     case add cd
       set -l result ($__meow_bin $argv)
@@ -358,102 +358,6 @@ pub fn cmd_prune(root: &Path, args: PruneArgs) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_fmt(repo: &Repository, root: &Path, args: FmtArgs) -> Result<()> {
-    let projects: Vec<String> = if args.all {
-        sparse::get_focused_projects(root)?
-    } else {
-        let project = match args.project {
-            Some(p) => p,
-            None => git::detect_project_from_cwd(root)?
-                .context("Not in a project directory. Specify project name.")?,
-        };
-        vec![project]
-    };
-
-    if projects.is_empty() {
-        info!("No active projects");
-        return Ok(());
-    }
-
-    // Load git tree for link validation (works on files not in sparse checkout)
-    let git_tree = git::list_all_paths(repo)?;
-    let mut has_errors = false;
-    let mut needs_formatting = false;
-
-    let opts = markdown::FormatOptions {
-        skip_encrypted: args.skip_encrypted,
-        check: args.check,
-    };
-
-    for project in &projects {
-        let result = markdown::format_project(root, project, Some(&git_tree), opts)?;
-        if print_format_result(project, &result, args.check).is_err() {
-            has_errors = true;
-        }
-        if result.files_formatted > 0 {
-            needs_formatting = true;
-        }
-    }
-
-    if has_errors {
-        anyhow::bail!("formatting failed")
-    }
-    if args.check && needs_formatting {
-        anyhow::bail!("files need formatting")
-    }
-    Ok(())
-}
-
-fn print_format_result(project: &str, result: &markdown::FormatResult, check: bool) -> Result<()> {
-    #[allow(clippy::print_stdout)]
-    {
-        if result.files_checked == 0 {
-            println!("No markdown files found for {project}");
-            return Ok(());
-        }
-
-        if check {
-            println!("Checking {project}...");
-        } else {
-            println!("Formatting {project}...");
-        }
-
-        for error in &result.errors {
-            for e in &error.errors {
-                if e.line() > 0 {
-                    println!("  {}:{}: {}", error.path, e.line(), e.message());
-                } else {
-                    println!("  {}: {}", error.path, e.message());
-                }
-            }
-        }
-
-        if result.errors.is_empty() {
-            if result.files_formatted > 0 {
-                let verb = if check {
-                    "need formatting"
-                } else {
-                    "formatted"
-                };
-                println!(
-                    "{} files checked, {} {}",
-                    result.files_checked, result.files_formatted, verb
-                );
-            } else {
-                println!("{} files checked, all ok", result.files_checked);
-            }
-        } else {
-            println!("{} files with errors", result.errors.len());
-        }
-    }
-
-    if result.errors.is_empty() {
-        Ok(())
-    } else {
-        anyhow::bail!("formatting failed")
-    }
-}
-
 pub fn cmd_journal(
     repo: &git2::Repository,
     root: &Path,
@@ -496,6 +400,9 @@ pub fn cmd_journal(
             if timeline.is_empty() {
                 continue;
             }
+            if found_any {
+                markdown::skin(use_color).print_text("\n---\n");
+            }
             found_any = true;
             let md = markdown::render_timeline(project, &timeline);
             markdown::skin(use_color).print_text(&md);
@@ -503,6 +410,9 @@ pub fn cmd_journal(
             // Original behavior: just journal entries
             if entries.is_empty() {
                 continue;
+            }
+            if found_any {
+                markdown::skin(use_color).print_text("\n---\n");
             }
             found_any = true;
             let md = markdown::render_entries(project, &entries);
@@ -558,20 +468,9 @@ description: TODO Add description
     fs::write(project_dir.join("README.md"), readme_content)
         .context("Failed to create README.md")?;
 
-    let agents_path = project_dir.join("AGENTS.md");
-    let mut agents_doc = parse("");
-    let agents_ctx = FormatContext {
-        project,
-        path: &agents_path,
-        year_month: None,
-        git_tree: None,
-        repo_root: None,
-    };
-    let errors = claude::validate(&agents_doc, &agents_ctx, "AGENTS.md");
-    for error in &errors {
-        error.fix(&mut agents_doc);
-    }
-    fs::write(&agents_path, serialize(&agents_doc)).context("Failed to create AGENTS.md")?;
+    let agents_content = format!("# {project}\n");
+    fs::write(project_dir.join("AGENTS.md"), agents_content)
+        .context("Failed to create AGENTS.md")?;
 
     let shell_nix_content = r#"{pkgs, ...}:
 pkgs.mkShell {
@@ -651,14 +550,21 @@ fn resolve_layout(project_path: &Path, tab_name: &str, layout_name: &str) -> Opt
     None // Fall back to named layout (no tab name injection possible)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_zellij(
     root: &Path,
     query: Option<String>,
     branch_parts: Vec<String>,
     layout: &str,
     worktree: bool,
+    prompt: Option<String>,
+    command: Option<String>,
     use_color: bool,
 ) -> Result<()> {
+    if prompt.is_some() && command.is_some() {
+        bail!("Cannot specify both --prompt and --command");
+    }
+
     let focused = sparse::get_focused_projects(root)?;
     if focused.is_empty() {
         bail!("No projects currently focused");
@@ -666,6 +572,8 @@ pub fn cmd_zellij(
 
     let project =
         picker::fuzzy_pick(focused, query.as_deref(), use_color)?.context("No project selected")?;
+
+    let exec = prompt.as_ref().or(command.as_ref());
 
     // Determine worktree mode:
     // - branch_parts non-empty → worktree with kebab-cased branch name
@@ -694,11 +602,177 @@ pub fn cmd_zellij(
         (root.join(PROJECTS_DIR).join(&project), project.clone())
     };
 
-    // Resolve layout: project custom > base layout with tab name injection > named layout
-    let layout_to_use = match resolve_layout(&project_path, &tab_name, layout) {
-        Some(content) => {
+    // If --prompt or --command was given, start opencode serve, create a session,
+    // fire the prompt/command, and build a layout that attaches the TUI to that session.
+    let exec_layout: Option<String> = if exec.is_some() {
+        if !use_worktree {
+            bail!(
+                "--prompt/--command requires a worktree (provide branch name parts or --worktree)"
+            );
+        }
+
+        // Spawn opencode serve with output going to a log file (no pipes).
+        // Pipes cause broken-pipe spin loops when meow exits.
+        let log_dir = crate::config::data_dir().context("No data dir")?;
+        let _ = fs::create_dir_all(&log_dir);
+        let log_path = log_dir.join(format!("serve-{}.log", &tab_name));
+        let log_stdout = fs::File::create(&log_path).context("Failed to create serve log file")?;
+        let log_stderr = log_stdout
+            .try_clone()
+            .context("Failed to clone log file handle")?;
+
+        let child = Command::new("opencode")
+            .args([
+                "serve",
+                "--port",
+                "0",
+                "--hostname",
+                "127.0.0.1",
+                "--print-logs",
+            ])
+            .current_dir(&project_path)
+            .stdout(log_stdout)
+            .stderr(log_stderr)
+            .spawn()
+            .context("Failed to spawn opencode serve")?;
+
+        let pid = child.id();
+
+        // Poll the log file for the port announcement (up to 30s).
+        let port = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if std::time::Instant::now() > deadline {
+                    bail!("Timed out waiting for opencode serve to announce port");
+                }
+                if let Ok(content) = fs::read_to_string(&log_path) {
+                    if let Some(port) = content.lines().find_map(web::extract_port) {
+                        break port;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        };
+
+        info!(port, "opencode serve started");
+
+        // HTTP calls (create session, send prompt) via tokio + reqwest.
+        let runtime = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+
+        let layout_content = runtime.block_on(async {
+            let base = format!("http://127.0.0.1:{port}");
+            let client = reqwest::Client::new();
+
+            // Poll until the server is ready (port binds before plugins finish loading).
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if tokio::time::Instant::now() > deadline {
+                    bail!("Timed out waiting for opencode serve to be ready");
+                }
+                if let Ok(r) = client.get(format!("{base}/session")).send().await {
+                    if r.status().is_success() {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+
+            info!(port, "opencode serve ready");
+
+            // Create a new session
+            let session: serde_json::Value = client
+                .post(format!("{base}/session"))
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .context("Failed to create opencode session")?
+                .json()
+                .await
+                .context("Failed to parse session response")?;
+
+            let sid = session["id"]
+                .as_str()
+                .context("No session ID in response")?
+                .to_owned();
+
+            info!(session_id = %sid, "opencode session created");
+
+            // Fire the prompt or command
+            if let Some(ref cmd) = command {
+                // Slash command: POST /session/{sid}/command (synchronous endpoint —
+                // server doesn't send response headers until the command finishes).
+                // Spawn as a background task so we don't block.
+                let cmd_str = cmd.strip_prefix('/').unwrap_or(cmd);
+                let (cmd_name, cmd_args) = match cmd_str.split_once(char::is_whitespace) {
+                    Some((name, args)) => (name.to_owned(), args.to_owned()),
+                    None => (cmd_str.to_owned(), String::new()),
+                };
+                let url = format!("{base}/session/{sid}/command");
+                let body = serde_json::json!({
+                    "command": &cmd_name,
+                    "arguments": &cmd_args
+                });
+                drop(tokio::spawn(async move {
+                    let _ = client.post(url).json(&body).send().await;
+                }));
+                info!(command = %cmd_name, arguments = %cmd_args, "command dispatched");
+            } else if let Some(ref prompt_text) = prompt {
+                // Free-form prompt: POST /session/{sid}/prompt_async (returns 204)
+                let _ = client
+                    .post(format!("{base}/session/{sid}/prompt_async"))
+                    .json(&serde_json::json!({
+                        "parts": [{"type": "text", "text": prompt_text}]
+                    }))
+                    .send()
+                    .await
+                    .context("Failed to send prompt")?;
+                info!(%prompt_text, "prompt dispatched");
+            }
+
+            // Load dev.kdl and swap the opencode command for an attach wrapper.
+            let layout_path = dirs::home_dir()
+                .context("No home dir")?
+                .join(".config/zellij/layouts/dev.kdl");
+            let base_layout = fs::read_to_string(&layout_path)
+                .context("Failed to read dev.kdl")?;
+
+            let wrapper_path = std::env::temp_dir()
+                .join(format!("meow-attach-{}.sh", &sid[..12.min(sid.len())]));
+            fs::write(
+                &wrapper_path,
+                format!(
+                    "#!/usr/bin/env bash\ntrap 'kill {pid} 2>/dev/null' EXIT\nopencode attach {base} --session {sid}\n"
+                ),
+            )
+            .context("Failed to write attach wrapper")?;
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mut perms = fs::metadata(&wrapper_path)?.permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&wrapper_path, perms)?;
+            }
+
+            let wrapper_str = wrapper_path.to_string_lossy();
+            let kdl = base_layout.replace(
+                r#"args "exec" "." "opencode""#,
+                &format!(r#"args "exec" "." "{wrapper_str}""#),
+            );
+            let kdl = inject_tab_name(&kdl, &tab_name, &project_path);
+
+            Ok::<String, anyhow::Error>(kdl)
+        })?;
+
+        Some(layout_content)
+    } else {
+        None
+    };
+
+    // Resolve layout: exec-generated > project custom > base layout with tab name injection > named layout
+    let layout_content = exec_layout.or_else(|| resolve_layout(&project_path, &tab_name, layout));
+    let layout_to_use = match layout_content {
+        Some(ref content) => {
             let path = std::env::temp_dir().join(format!("meow-{}.kdl", std::process::id()));
-            fs::write(&path, &content).context("Failed to write temp layout")?;
+            fs::write(&path, content).context("Failed to write temp layout")?;
             path.to_string_lossy().to_string()
         }
         None => layout.to_string(),
@@ -805,59 +879,6 @@ pub fn cmd_zellij(
     Ok(())
 }
 
-/// Check if stdout is safe for decrypted content.
-/// Allows: TTY (terminal), or non-file output when running under Claude Code.
-/// Blocks: regular files (redirects like `> file.txt`).
-fn is_stdout_allowed() -> bool {
-    use std::io::IsTerminal;
-
-    // TTY is always allowed
-    if std::io::stdout().is_terminal() {
-        return true;
-    }
-
-    // Check stdout type via /dev/fd/1
-    let is_regular_file = std::fs::metadata("/dev/fd/1")
-        .map(|m| m.file_type().is_file())
-        .unwrap_or(false);
-
-    // Block regular files (redirects)
-    // Allow pipes/sockets/etc only under Claude Code
-    if is_regular_file {
-        false
-    } else {
-        std::env::var("CLAUDECODE").is_ok()
-    }
-}
-
-pub fn cmd_decrypt(file: &Path, in_place: bool) -> Result<()> {
-    let content =
-        fs::read_to_string(file).with_context(|| format!("failed to read {}", file.display()))?;
-
-    if !is_encrypted(&content) {
-        bail!("file is not encrypted: {}", file.display());
-    }
-
-    let (doc, _original_body) = parse_encrypted(&content)?;
-    let decrypted = serialize(&doc);
-
-    if in_place {
-        fs::write(file, &decrypted)
-            .with_context(|| format!("failed to write {}", file.display()))?;
-        info!("Decrypted {}", file.display());
-    } else {
-        if !is_stdout_allowed() {
-            bail!("refusing to write decrypted content to file (use -i to decrypt in-place)");
-        }
-        #[allow(clippy::print_stdout)]
-        {
-            print!("{}", decrypted);
-        }
-    }
-
-    Ok(())
-}
-
 /// Exit code indicating mirror is already synced (no work needed).
 pub const EXIT_ALREADY_SYNCED: u8 = 2;
 
@@ -890,37 +911,50 @@ fn cmd_mirror_status(root: &Path, use_color: bool) -> Result<()> {
     Ok(())
 }
 
+fn humanize_age(unsynced_since: i64) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let secs = (now - unsynced_since).max(0) as u64;
+    if secs < 3600 {
+        let mins = secs / 60;
+        format!("{} min ago", mins.max(1))
+    } else if secs < 86400 {
+        let hours = secs / 3600;
+        format!("{} hour{} ago", hours, if hours == 1 { "" } else { "s" })
+    } else {
+        let days = secs / 86400;
+        format!("{} day{} ago", days, if days == 1 { "" } else { "s" })
+    }
+}
+
 fn render_mirror_table(statuses: &[mirror::MirrorStatus]) -> String {
     let mut md = String::new();
-    md.push_str("| Project | Version | Remote | Public | Private | Alerts |\n");
-    md.push_str("|:--------|:--------|:-------|:-------|:--------|:-------|\n");
+    md.push_str("| Project | Code | Templates | Alerts |\n");
+    md.push_str("|:--------|:-----|:----------|:-------|\n");
 
     for s in statuses {
-        let version = s.version.as_deref().unwrap_or("-");
-
-        let public = s
-            .sync_info
-            .as_ref()
-            .map(|si| &si.commit[..7])
-            .unwrap_or("?");
-
-        let private = match s.commits_ahead {
-            Some(0) if s.templates_stale => {
-                format!("{} (stale templates)", &s.private_commit[..7])
+        let code = match s.commits_ahead {
+            None => "?".to_string(),
+            Some(0) => "synced".to_string(),
+            Some(n) => {
+                let age = s
+                    .unsynced_since
+                    .map(humanize_age)
+                    .unwrap_or_else(|| "?".to_string());
+                format!("{} commit{} ({})", n, if n == 1 { "" } else { "s" }, age)
             }
-            Some(0) => s.private_commit[..7].to_string(),
-            Some(n) if s.templates_stale => {
-                format!("{} (+{}, stale templates)", &s.private_commit[..7], n)
-            }
-            Some(n) => format!("{} (+{})", &s.private_commit[..7], n),
-            None => format!("{} (+?)", &s.private_commit[..7]),
         };
+
+        let templates = if s.templates_stale { "stale" } else { "ok" };
 
         let alerts = github::format_alerts(&s.dependabot_alerts);
 
         md.push_str(&format!(
-            "| {} | {} | {}/{} | {} | {} | {} |\n",
-            s.project, version, s.config.org, s.config.repo, public, private, alerts
+            "| {} | {} | {} | {} |\n",
+            s.project, code, templates, alerts
         ));
     }
 
@@ -950,9 +984,8 @@ fn cmd_mirror_diff(root: &Path, project: Option<String>, no_scan: bool) -> Resul
     }
 
     let content = fs::read_to_string(&readme_path)?;
-    let doc = parse(&content);
-    let config = doc
-        .frontmatter
+    let fm = parse_frontmatter(&content);
+    let config = fm
         .as_ref()
         .and_then(mirror::MirrorConfig::from_frontmatter)
         .with_context(|| {
@@ -969,8 +1002,11 @@ fn cmd_mirror_diff(root: &Path, project: Option<String>, no_scan: bool) -> Resul
     let mirror_path = mirror::ensure_clone(&config.org, &config.repo)?;
 
     // Check if sync is needed (both commit and template hash must match)
+    let source_path = root.join(PROJECTS_DIR).join(&project);
     let latest_commit = mirror::get_latest_project_commit(root, &project)?;
-    let expected_template_hash = mirror::compute_template_hash(&config.workflows);
+    let setup_steps = mirror::read_setup_steps(&source_path)?;
+    let expected_template_hash =
+        mirror::compute_template_hash(&config.workflows, setup_steps.as_deref());
     if let Some(sync_info) = mirror::get_sync_info(&mirror_path) {
         if sync_info.commit == latest_commit && sync_info.templates_hash == expected_template_hash {
             #[allow(clippy::print_stdout)]
@@ -986,7 +1022,6 @@ fn cmd_mirror_diff(root: &Path, project: Option<String>, no_scan: bool) -> Resul
     }
 
     // Sync filtered content to mirror
-    let source_path = root.join(PROJECTS_DIR).join(&project);
     let file_count = mirror::sync_to_mirror(&source_path, &mirror_path, &config)?;
 
     // Write sync info for shipit-mirror to use when creating the tag
@@ -1031,9 +1066,8 @@ fn cmd_mirror_push(root: &Path, project: Option<String>, message: &str) -> Resul
     }
 
     let content = fs::read_to_string(&readme_path)?;
-    let doc = parse(&content);
-    let config = doc
-        .frontmatter
+    let fm = parse_frontmatter(&content);
+    let config = fm
         .as_ref()
         .and_then(mirror::MirrorConfig::from_frontmatter)
         .with_context(|| {
@@ -1074,11 +1108,7 @@ fn cmd_mirror_push(root: &Path, project: Option<String>, message: &str) -> Resul
     }
 
     // Sync repo description from frontmatter
-    if let Some(desc) = doc
-        .frontmatter
-        .as_ref()
-        .and_then(|fm| fm.description.as_ref())
-    {
+    if let Some(desc) = fm.as_ref().and_then(|f| f.description.as_ref()) {
         match mirror::sync_repo_description(&config.org, &config.repo, desc) {
             Ok(()) => info!("Synced repo description"),
             Err(e) => warn!("Description sync failed: {}", e),
@@ -1104,6 +1134,7 @@ pub fn cmd_web(
     root: &Path,
     query: Option<String>,
     command: Option<WebCommand>,
+    sandbox: Option<bool>,
     use_color: bool,
 ) -> Result<Option<u8>> {
     let runtime = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
@@ -1160,7 +1191,22 @@ pub fn cmd_web(
         }
 
         None => {
-            let web_config = crate::config::Config::load()?.web;
+            let mut web_config = crate::config::Config::load()?.web;
+
+            // Apply --sandbox CLI override.
+            if let Some(want_sandbox) = sandbox {
+                if want_sandbox {
+                    match web_config.sandbox {
+                        Some(ref mut s) => s.enabled = true,
+                        None => bail!(
+                            "--sandbox requires sandbox config in config.yaml \
+                             (web.sandbox.nj_bin, alice_bin, sandbox_package)"
+                        ),
+                    }
+                } else {
+                    web_config.sandbox = None;
+                }
+            }
 
             // No query and no subcommand → open the home landing page
             if query.is_none() {

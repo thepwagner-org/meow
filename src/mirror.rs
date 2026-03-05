@@ -5,7 +5,7 @@
 
 use crate::config;
 use crate::github;
-use crate::markdown::{parse, Frontmatter};
+use crate::markdown::{parse_frontmatter, Frontmatter};
 use crate::PROJECTS_DIR;
 use anyhow::{bail, Context, Result};
 use std::collections::hash_map::DefaultHasher;
@@ -27,6 +27,7 @@ pub const HARDCODED_EXCLUDES: &[&str] = &[
     ".claude/",
     ".opencode/",
     ".envrc",
+    "actions-setup.yml",
 ];
 
 /// MIT license text to inject into mirrored repositories.
@@ -195,9 +196,9 @@ impl SyncInfo {
     }
 }
 
-/// Compute a content hash for the given workflow template names.
-/// The hash changes when template contents change or the set of workflows changes.
-pub fn compute_template_hash(workflows: &[String]) -> String {
+/// Compute a content hash for the given workflow template names and setup steps.
+/// The hash changes when template contents, setup steps, or the set of workflows changes.
+pub fn compute_template_hash(workflows: &[String], setup_steps: Option<&str>) -> String {
     let mut hasher = DefaultHasher::new();
 
     // Sort to make hash independent of frontmatter ordering
@@ -209,6 +210,10 @@ pub fn compute_template_hash(workflows: &[String]) -> String {
         if let Some(t) = WORKFLOW_TEMPLATES.iter().find(|t| t.name == *name) {
             t.workflow.hash(&mut hasher);
         }
+    }
+
+    if let Some(content) = setup_steps {
+        content.hash(&mut hasher);
     }
 
     format!("{:016x}", hasher.finish())
@@ -334,6 +339,54 @@ fn strip_frontmatter(content: &str) -> String {
     }
 }
 
+/// Path to the optional per-project setup steps file.
+const SETUP_STEPS_PATH: &str = ".github/actions-setup.yml";
+
+/// Read optional setup steps from a project directory.
+/// Returns None if the file doesn't exist.
+pub fn read_setup_steps(project_path: &Path) -> Result<Option<String>> {
+    let path = project_path.join(SETUP_STEPS_PATH);
+    if path.exists() {
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Ok(Some(content))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Replace `# {{setup}}` markers in a workflow template with setup steps.
+/// If no setup content is provided, marker lines are removed.
+fn apply_setup_steps(template: &str, setup_content: Option<&str>) -> String {
+    let marker = "# {{setup}}";
+    let mut lines: Vec<String> = Vec::new();
+
+    for line in template.lines() {
+        if line.trim() == marker {
+            if let Some(content) = setup_content {
+                let indent_len = line.len() - line.trim_start().len();
+                let indent: String = line.chars().take(indent_len).collect();
+                for setup_line in content.trim_end().lines() {
+                    if setup_line.trim().is_empty() {
+                        lines.push(String::new());
+                    } else {
+                        lines.push(format!("{indent}{setup_line}"));
+                    }
+                }
+            }
+            // If no setup content, skip the marker line entirely
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+
+    let mut result = lines.join("\n");
+    if template.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
 /// Get list of git-tracked files in a project directory.
 fn get_tracked_files(project_path: &Path) -> Result<Vec<PathBuf>> {
     let output = Command::new("git")
@@ -405,6 +458,9 @@ pub fn sync_to_mirror(
     fs::write(mirror_path.join("LICENSE.md"), MIT_LICENSE)?;
     file_count += 1;
 
+    // Read optional setup steps
+    let setup_steps = read_setup_steps(source_project)?;
+
     // Inject workflow templates
     if !config.workflows.is_empty() {
         let workflows_dir = mirror_path.join(".github").join("workflows");
@@ -416,7 +472,8 @@ pub fn sync_to_mirror(
                 .find(|t| t.name == workflow_name.as_str())
             {
                 let filename = format!("{}.yaml", workflow_name);
-                fs::write(workflows_dir.join(&filename), template.workflow)?;
+                let content = apply_setup_steps(template.workflow, setup_steps.as_deref());
+                fs::write(workflows_dir.join(&filename), content)?;
                 file_count += 1;
 
                 tracing::debug!(workflow = %workflow_name, "injected workflow template");
@@ -518,6 +575,27 @@ pub fn get_latest_project_commit(root: &Path, project: &str) -> Result<String> {
     Ok(hash)
 }
 
+/// Get the unix timestamp of the oldest commit in `from..to` that touched a project directory.
+/// Returns None if the range is empty or the command fails.
+fn get_oldest_unsynced_commit_time(
+    root: &Path,
+    project: &str,
+    from: &str,
+    to: &str,
+) -> Option<i64> {
+    let project_path = root.join(PROJECTS_DIR).join(project);
+    let range = format!("{}..{}", from, to);
+    // --reverse gives oldest first; we take the first line
+    let output = Command::new("git")
+        .args(["log", "--reverse", "--format=%ct", &range, "--"])
+        .arg(&project_path)
+        .current_dir(root)
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.lines().next()?.trim().parse().ok()
+}
+
 /// Count commits between two commits that touched a project directory.
 /// Returns the number of commits in `from..to` range that modified the project.
 fn count_project_commits(root: &Path, project: &str, from: &str, to: &str) -> Option<usize> {
@@ -556,9 +634,8 @@ pub fn find_mirrored_projects(root: &Path) -> Result<Vec<(String, MirrorConfig)>
         }
 
         if let Ok(content) = fs::read_to_string(&readme_path) {
-            let doc = parse(&content);
-            if let Some(ref fm) = doc.frontmatter {
-                if let Some(config) = MirrorConfig::from_frontmatter(fm) {
+            if let Some(fm) = parse_frontmatter(&content) {
+                if let Some(config) = MirrorConfig::from_frontmatter(&fm) {
                     results.push((project_name, config));
                 }
             }
@@ -788,6 +865,8 @@ pub struct MirrorStatus {
     pub private_commit: String,
     /// Number of commits between public and private (None if public unknown)
     pub commits_ahead: Option<usize>,
+    /// Unix timestamp of the oldest unsynced commit (None if synced or unknown)
+    pub unsynced_since: Option<i64>,
     /// Whether the workflow templates are stale (current hash doesn't match synced hash)
     pub templates_stale: bool,
     /// Open Dependabot alerts on the public repo (None if `gh` unavailable)
@@ -819,12 +898,20 @@ pub fn get_all_status(root: &Path) -> Result<Vec<MirrorStatus>> {
         let commits_ahead = sync_info
             .as_ref()
             .and_then(|si| count_project_commits(root, &project, &si.commit, &private_commit));
+        let unsynced_since = match (&sync_info, commits_ahead) {
+            (Some(si), Some(n)) if n > 0 => {
+                get_oldest_unsynced_commit_time(root, &project, &si.commit, &private_commit)
+            }
+            _ => None,
+        };
 
         // Check template staleness (skip if project has no templates)
         let templates_stale = if config.workflows.is_empty() {
             false
         } else {
-            let expected_hash = compute_template_hash(&config.workflows);
+            let project_path = root.join(PROJECTS_DIR).join(&project);
+            let setup_steps = read_setup_steps(&project_path).unwrap_or(None);
+            let expected_hash = compute_template_hash(&config.workflows, setup_steps.as_deref());
             sync_info
                 .as_ref()
                 .map(|si| si.templates_hash != expected_hash)
@@ -844,6 +931,7 @@ pub fn get_all_status(root: &Path) -> Result<Vec<MirrorStatus>> {
             sync_info,
             private_commit,
             commits_ahead,
+            unsynced_since,
             templates_stale,
             dependabot_alerts,
             version,
@@ -1047,8 +1135,8 @@ mod tests {
     #[test]
     fn test_template_hash_deterministic() {
         let workflows = vec!["cargo-ci".to_string()];
-        let h1 = compute_template_hash(&workflows);
-        let h2 = compute_template_hash(&workflows);
+        let h1 = compute_template_hash(&workflows, None);
+        let h2 = compute_template_hash(&workflows, None);
         assert_eq!(h1, h2);
     }
 
@@ -1056,7 +1144,10 @@ mod tests {
     fn test_template_hash_order_independent() {
         let a = vec!["cargo-ci".to_string(), "pnpm-ci".to_string()];
         let b = vec!["pnpm-ci".to_string(), "cargo-ci".to_string()];
-        assert_eq!(compute_template_hash(&a), compute_template_hash(&b));
+        assert_eq!(
+            compute_template_hash(&a, None),
+            compute_template_hash(&b, None)
+        );
     }
 
     #[test]
@@ -1064,16 +1155,90 @@ mod tests {
         let cargo = vec!["cargo-ci".to_string()];
         let pnpm = vec!["pnpm-ci".to_string()];
         let both = vec!["cargo-ci".to_string(), "pnpm-ci".to_string()];
-        assert_ne!(compute_template_hash(&cargo), compute_template_hash(&pnpm));
-        assert_ne!(compute_template_hash(&cargo), compute_template_hash(&both));
+        assert_ne!(
+            compute_template_hash(&cargo, None),
+            compute_template_hash(&pnpm, None)
+        );
+        assert_ne!(
+            compute_template_hash(&cargo, None),
+            compute_template_hash(&both, None)
+        );
     }
 
     #[test]
     fn test_template_hash_empty() {
         let empty: Vec<String> = vec![];
-        let h = compute_template_hash(&empty);
+        let h = compute_template_hash(&empty, None);
         // Empty should still produce a valid hash
         assert_eq!(h.len(), 16);
+    }
+
+    #[test]
+    fn test_template_hash_differs_with_setup() {
+        let workflows = vec!["cargo-ci".to_string()];
+        let without = compute_template_hash(&workflows, None);
+        let with = compute_template_hash(&workflows, Some("- run: apt-get install protoc\n"));
+        assert_ne!(without, with);
+    }
+
+    #[test]
+    fn test_template_hash_setup_content_matters() {
+        let workflows = vec!["cargo-ci".to_string()];
+        let a = compute_template_hash(&workflows, Some("- run: install-a\n"));
+        let b = compute_template_hash(&workflows, Some("- run: install-b\n"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_apply_setup_steps_no_content() {
+        let template =
+            "    steps:\n      - uses: checkout\n      # {{setup}}\n      - run: build\n";
+        let result = apply_setup_steps(template, None);
+        assert_eq!(
+            result,
+            "    steps:\n      - uses: checkout\n      - run: build\n"
+        );
+    }
+
+    #[test]
+    fn test_apply_setup_steps_with_content() {
+        let template =
+            "    steps:\n      - uses: checkout\n      # {{setup}}\n      - run: build\n";
+        let setup = "- uses: arduino/setup-protoc@abc123\n";
+        let result = apply_setup_steps(template, Some(setup));
+        assert_eq!(
+            result,
+            "    steps:\n      - uses: checkout\n      - uses: arduino/setup-protoc@abc123\n      - run: build\n"
+        );
+    }
+
+    #[test]
+    fn test_apply_setup_steps_preserves_relative_indent() {
+        let template = "      # {{setup}}\n      - run: build\n";
+        let setup = "- uses: some-action@v1\n  with:\n    key: value\n";
+        let result = apply_setup_steps(template, Some(setup));
+        assert_eq!(
+            result,
+            "      - uses: some-action@v1\n        with:\n          key: value\n      - run: build\n"
+        );
+    }
+
+    #[test]
+    fn test_apply_setup_steps_no_marker() {
+        let template = "    steps:\n      - run: build\n";
+        let result = apply_setup_steps(template, Some("- run: setup\n"));
+        assert_eq!(result, template);
+    }
+
+    #[test]
+    fn test_apply_setup_steps_multiple_steps() {
+        let template = "      # {{setup}}\n      - run: build\n";
+        let setup = "- name: Install protoc\n  run: apt-get install protobuf-compiler\n- name: Install jq\n  run: apt-get install jq\n";
+        let result = apply_setup_steps(template, Some(setup));
+        assert_eq!(
+            result,
+            "      - name: Install protoc\n        run: apt-get install protobuf-compiler\n      - name: Install jq\n        run: apt-get install jq\n      - run: build\n"
+        );
     }
 
     #[test]
