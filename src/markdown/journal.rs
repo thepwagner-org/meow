@@ -58,22 +58,29 @@ fn default_sort_time() -> NaiveTime {
 }
 
 /// Parse a journal heading, returning (date, optional time).
-/// Accepts "YYYY-MM-DD" or "YYYY-MM-DD HH:MM".
+/// Accepts "YYYY-MM-DD", "YYYY-MM-DD HH:MM", or "YYYY-MM-DD HH:MM - Title".
 fn parse_journal_heading(text: &str) -> Option<(NaiveDate, Option<NaiveTime>)> {
     let text = text.trim();
 
-    // Try datetime first: "2025-11-29 14:30"
     if text.len() > 10 && text.as_bytes().get(10) == Some(&b' ') {
-        let (date_part, time_part) = text.split_at(10);
-        let time_part = time_part.trim_start();
-        if let Ok(date) = NaiveDate::parse_from_str(date_part, "%Y-%m-%d") {
-            if let Ok(time) = NaiveTime::parse_from_str(time_part, "%H:%M") {
-                return Some((date, Some(time)));
-            }
+        let (date_part, rest) = text.split_at(10);
+        let date = NaiveDate::parse_from_str(date_part, "%Y-%m-%d").ok()?;
+        let first_token = rest.trim_start().split_whitespace().next().unwrap_or("");
+
+        // If the next token is "-", this is a titled date-only heading
+        // (e.g. "2026-02-06 - 1:1 with Kaiyi") — date only.
+        if first_token == "-" {
+            return Some((date, None));
         }
+
+        // Otherwise treat it as a time token and require it to be valid HH:MM.
+        // This rejects malformed entries like "2025-11-29 25:00" or "2025-11-29 14"
+        // rather than silently falling back to date-only.
+        let time = NaiveTime::parse_from_str(first_token, "%H:%M").ok()?;
+        return Some((date, Some(time)));
     }
 
-    // Fall back to date only: "2025-11-29"
+    // Plain date: "2025-11-29"
     if let Ok(date) = NaiveDate::parse_from_str(text, "%Y-%m-%d") {
         return Some((date, None));
     }
@@ -256,6 +263,25 @@ mod tests {
             time,
             Some(NaiveTime::from_hms_opt(14, 30, 0).expect("valid"))
         );
+    }
+
+    #[test]
+    fn test_parse_journal_heading_with_title() {
+        // "YYYY-MM-DD HH:MM - Title" should parse date+time, ignoring the title
+        let (date, time) = parse_journal_heading("2026-02-02 08:24 - Vibe Check").expect("valid");
+        assert_eq!(date, NaiveDate::from_ymd_opt(2026, 2, 2).expect("valid"));
+        assert_eq!(
+            time,
+            Some(NaiveTime::from_hms_opt(8, 24, 0).expect("valid"))
+        );
+    }
+
+    #[test]
+    fn test_parse_journal_heading_date_with_title() {
+        // "YYYY-MM-DD - Title" should parse date only, ignoring the title
+        let (date, time) = parse_journal_heading("2026-02-06 - 1:1 with Kaiyi").expect("valid");
+        assert_eq!(date, NaiveDate::from_ymd_opt(2026, 2, 6).expect("valid"));
+        assert!(time.is_none());
     }
 
     #[test]
