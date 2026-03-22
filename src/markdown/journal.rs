@@ -65,7 +65,7 @@ fn parse_journal_heading(text: &str) -> Option<(NaiveDate, Option<NaiveTime>)> {
     if text.len() > 10 && text.as_bytes().get(10) == Some(&b' ') {
         let (date_part, rest) = text.split_at(10);
         let date = NaiveDate::parse_from_str(date_part, "%Y-%m-%d").ok()?;
-        let first_token = rest.trim_start().split_whitespace().next().unwrap_or("");
+        let first_token = rest.split_whitespace().next().unwrap_or("");
 
         // If the next token is "-", this is a titled date-only heading
         // (e.g. "2026-02-06 - 1:1 with Kaiyi") — date only.
