@@ -41,183 +41,27 @@ fn expand_tilde(path: &str) -> Result<PathBuf> {
     }
 }
 
-// ── Raw deserialization structs ───────────────────────────────────────────────
-
-#[derive(Debug, Deserialize, Default)]
-struct HostConfigFile {
-    hostname: String,
-    tls_cert: Option<String>,
-    tls_key: Option<String>,
-}
-
-/// Raw web config as it appears in the YAML file.
-/// Supports both the legacy flat format and the new `hosts` array.
-///
-/// Legacy (single host):
-/// ```yaml
-/// web:
-///   hostname: code.example.net
-///   tls_cert: ~/.config/meow/cert.pem
-///   tls_key:  ~/.config/meow/key.pem
-/// ```
-///
-/// New (multiple virtual hosts):
-/// ```yaml
-/// web:
-///   http_port: 3080
-///   port: 3443
-///   hosts:
-///     - hostname: localhost
-///     - hostname: code.example.net
-///       tls_cert: ~/.config/meow/cert.pem
-///       tls_key:  ~/.config/meow/key.pem
-/// ```
-#[derive(Debug, Deserialize, Default)]
-struct SandboxConfigFile {
-    enabled: Option<bool>,
-    nj_bin: Option<String>,
-    alice_bin: Option<String>,
-    sandbox_package: Option<String>,
-    credential_config: Option<String>,
-    network_policy: Option<String>,
-    #[serde(default)]
-    extra_packages: Vec<String>,
-    nix_jail_url: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct WebConfigFile {
-    // Legacy single-host fields
-    hostname: Option<String>,
-    tls_cert: Option<String>,
-    tls_key: Option<String>,
-    // New multi-host fields
-    hosts: Option<Vec<HostConfigFile>>,
-    bind: Option<String>,
-    port: Option<u16>,
-    http_port: Option<u16>,
-    #[serde(default)]
-    sandbox: SandboxConfigFile,
-}
+// ── Raw deserialization struct ────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct ConfigFile {
     repo_path: Option<String>,
-    #[serde(default)]
-    web: WebConfigFile,
+    /// Base URL of the nj-web HTTP API, e.g. `"https://home.example.com"`.
+    nj_web_url: Option<String>,
+    /// Base domain for nj-web subdomains, e.g. `"example.com"`.
+    base_domain: Option<String>,
 }
 
-// ── Public config structs ─────────────────────────────────────────────────────
-
-/// Configuration for a single virtual host.
-#[derive(Debug, Clone)]
-pub struct HostConfig {
-    /// Public hostname (e.g. "code.example.net" or "localhost").
-    pub hostname: String,
-    /// Path to TLS certificate PEM file. If absent, this host is served over HTTP.
-    pub tls_cert: Option<PathBuf>,
-    /// Path to TLS private key PEM file. If absent, this host is served over HTTP.
-    pub tls_key: Option<PathBuf>,
-}
-
-impl HostConfig {
-    pub fn tls_enabled(&self) -> bool {
-        self.tls_cert.is_some() && self.tls_key.is_some()
-    }
-}
-
-/// Nix-jail sandbox configuration for spawning opencode.
-///
-/// When enabled, `meow web` wraps opencode in `nj exec` (submitting to the
-/// `nixjaild` daemon) instead of spawning it directly. Credentials are injected
-/// by alice server-side; the direnv environment is not captured.
-///
-/// Example config.yaml:
-/// ```yaml
-/// web:
-///   sandbox:
-///     enabled: true
-///     nj_bin: ~/src/projects/nix-jail/target/debug/client
-///     alice_bin: ~/src/projects/alice/target/debug/alice
-///     sandbox_package: "/Users/pwagner/src#devShells.aarch64-darwin.sandbox"
-/// ```
-#[derive(Debug, Clone)]
-pub struct SandboxConfig {
-    /// Whether sandboxing is active. Defaults to false.
-    pub enabled: bool,
-    /// Path to the nix-jail client binary (`nj`).
-    pub nj_bin: PathBuf,
-    /// Path to the alice MITM proxy binary.
-    pub alice_bin: PathBuf,
-    /// Nix package or flake installable providing sandbox base tools (opencode,
-    /// zsh, coreutils, git). E.g. `"opencode"` for a plain nixpkgs name or
-    /// `"/Users/pwagner/src#devShells.aarch64-darwin.sandbox"` for a flake devShell.
-    pub sandbox_package: String,
-    /// Path to a credential TOML override. If absent, meow uses built-in defaults.
-    pub credential_config: Option<PathBuf>,
-    /// Path to a network policy TOML override. If absent, meow uses built-in defaults.
-    pub network_policy: Option<PathBuf>,
-    /// Additional nix packages to include in the sandbox.
-    pub extra_packages: Vec<String>,
-    /// gRPC URL of the nixjaild daemon.
-    /// Used as the `--server` argument when invoking `nj exec`.
-    /// Defaults to `"http://127.0.0.1:50051"`.
-    pub nix_jail_url: String,
-}
-
-/// Web proxy configuration.
-#[derive(Debug, Clone)]
-pub struct WebConfig {
-    /// Virtual hosts to serve. At least one must be present.
-    pub hosts: Vec<HostConfig>,
-    /// IP address to bind the server on (e.g. "0.0.0.0" or "127.0.0.1")
-    pub bind: String,
-    /// HTTPS port (only bound when at least one host has TLS configured).
-    pub port: u16,
-    /// HTTP port (always bound).
-    pub http_port: u16,
-    /// Nix-jail sandbox configuration. None when sandboxing is disabled.
-    pub sandbox: Option<SandboxConfig>,
-}
-
-impl WebConfig {
-    /// Returns true if any virtual host has TLS configured.
-    pub fn has_tls_hosts(&self) -> bool {
-        self.hosts.iter().any(|h| h.tls_enabled())
-    }
-
-    /// Returns only the TLS-enabled hosts.
-    pub fn tls_hosts(&self) -> Vec<&HostConfig> {
-        self.hosts.iter().filter(|h| h.tls_enabled()).collect()
-    }
-
-    /// Look up the host config that matches a bare hostname (no port).
-    /// Returns `None` if no configured host matches.
-    pub fn host_config_for(&self, bare_hostname: &str) -> Option<&HostConfig> {
-        self.hosts.iter().find(|h| h.hostname == bare_hostname)
-    }
-}
-
-impl Default for WebConfig {
-    fn default() -> Self {
-        Self {
-            hosts: vec![HostConfig {
-                hostname: "localhost".to_string(),
-                tls_cert: None,
-                tls_key: None,
-            }],
-            bind: "0.0.0.0".to_string(),
-            port: 3443,
-            http_port: 3080,
-            sandbox: None,
-        }
-    }
-}
+// ── Public config struct ──────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct Config {
     pub repo_path: PathBuf,
-    pub web: WebConfig,
+    /// Base URL for nj-web job submissions (e.g. `"https://home.example.com"`).
+    pub nj_web_url: String,
+    /// Base domain used to construct job subdomain URLs
+    /// (e.g. `"example.com"` → `"myproject-abc123.example.com"`).
+    pub base_domain: String,
 }
 
 impl Default for Config {
@@ -227,7 +71,8 @@ impl Default for Config {
             .unwrap_or_else(|| PathBuf::from("/src"));
         Self {
             repo_path,
-            web: WebConfig::default(),
+            nj_web_url: String::new(),
+            base_domain: String::new(),
         }
     }
 }
@@ -243,7 +88,7 @@ impl Config {
         if let Ok(repo_path) = env::var("MEOW_REPO_PATH") {
             return Ok(Self {
                 repo_path: PathBuf::from(repo_path),
-                web: WebConfig::default(),
+                ..Self::default()
             });
         }
 
@@ -264,101 +109,10 @@ impl Config {
             None => Self::default().repo_path,
         };
 
-        let web = {
-            let f = file.web;
-            let defaults = WebConfig::default();
-
-            // Resolve the hosts list. Prefer the new `hosts` array; fall back to
-            // legacy flat fields (hostname / tls_cert / tls_key) as a single entry.
-            let hosts: Vec<HostConfig> = if let Some(raw_hosts) = f.hosts {
-                raw_hosts
-                    .into_iter()
-                    .map(|h| {
-                        let tls_cert = h.tls_cert.as_deref().map(expand_tilde).transpose()?;
-                        let tls_key = h.tls_key.as_deref().map(expand_tilde).transpose()?;
-                        Ok(HostConfig {
-                            hostname: h.hostname,
-                            tls_cert,
-                            tls_key,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            } else {
-                // Legacy single-host format
-                let hostname = f
-                    .hostname
-                    .unwrap_or_else(|| defaults.hosts[0].hostname.clone());
-                let tls_cert = f.tls_cert.as_deref().map(expand_tilde).transpose()?;
-                let tls_key = f.tls_key.as_deref().map(expand_tilde).transpose()?;
-                vec![HostConfig {
-                    hostname,
-                    tls_cert,
-                    tls_key,
-                }]
-            };
-
-            if hosts.is_empty() {
-                anyhow::bail!("web.hosts must not be empty");
-            }
-
-            // Parse optional sandbox config.
-            let sandbox = if f.sandbox.enabled.unwrap_or(false) {
-                let nj_bin = f
-                    .sandbox
-                    .nj_bin
-                    .as_deref()
-                    .map(expand_tilde)
-                    .transpose()?
-                    .context("web.sandbox.nj_bin is required when sandbox is enabled")?;
-                let alice_bin = f
-                    .sandbox
-                    .alice_bin
-                    .as_deref()
-                    .map(expand_tilde)
-                    .transpose()?
-                    .context("web.sandbox.alice_bin is required when sandbox is enabled")?;
-                let sandbox_package = f
-                    .sandbox
-                    .sandbox_package
-                    .unwrap_or_else(|| "opencode".to_string());
-                let credential_config = f
-                    .sandbox
-                    .credential_config
-                    .as_deref()
-                    .map(expand_tilde)
-                    .transpose()?;
-                let network_policy = f
-                    .sandbox
-                    .network_policy
-                    .as_deref()
-                    .map(expand_tilde)
-                    .transpose()?;
-                Some(SandboxConfig {
-                    enabled: true,
-                    nj_bin,
-                    alice_bin,
-                    sandbox_package,
-                    credential_config,
-                    network_policy,
-                    extra_packages: f.sandbox.extra_packages,
-                    nix_jail_url: f
-                        .sandbox
-                        .nix_jail_url
-                        .unwrap_or_else(|| "http://127.0.0.1:50051".to_string()),
-                })
-            } else {
-                None
-            };
-
-            WebConfig {
-                hosts,
-                bind: f.bind.unwrap_or(defaults.bind),
-                port: f.port.unwrap_or(defaults.port),
-                http_port: f.http_port.unwrap_or(defaults.http_port),
-                sandbox,
-            }
-        };
-
-        Ok(Self { repo_path, web })
+        Ok(Self {
+            repo_path,
+            nj_web_url: file.nj_web_url.unwrap_or_default(),
+            base_domain: file.base_domain.unwrap_or_default(),
+        })
     }
 }

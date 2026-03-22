@@ -17,6 +17,30 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+/// How a project should be indexed by QMD.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QmdMode {
+    /// Add collection, do not auto-embed.
+    Index,
+    /// Add collection and run `qmd embed` after sync.
+    Embed,
+}
+
+impl QmdMode {
+    /// Parse from a serde_yaml::Value. Treats null/missing/false as None.
+    pub fn from_value(v: &serde_yaml::Value) -> Option<Self> {
+        match v {
+            serde_yaml::Value::String(s) => match s.as_str() {
+                "embed" => Some(Self::Embed),
+                "true" => Some(Self::Index),
+                _ => None,
+            },
+            serde_yaml::Value::Bool(true) => Some(Self::Index),
+            _ => None,
+        }
+    }
+}
+
 /// YAML frontmatter fields.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Frontmatter {
@@ -27,6 +51,13 @@ pub struct Frontmatter {
     /// All other frontmatter fields.
     #[serde(flatten)]
     pub extra: HashMap<String, serde_yaml::Value>,
+}
+
+impl Frontmatter {
+    /// Returns the QMD indexing mode if configured.
+    pub fn qmd_mode(&self) -> Option<QmdMode> {
+        self.extra.get("qmd").and_then(QmdMode::from_value)
+    }
 }
 
 /// Extract frontmatter from markdown content.

@@ -8,7 +8,6 @@ pub mod markdown;
 pub mod mirror;
 pub mod picker;
 pub mod sparse;
-pub mod web;
 
 /// Directory name for projects within the monorepo
 pub const PROJECTS_DIR: &str = "projects";

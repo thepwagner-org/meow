@@ -196,9 +196,14 @@ impl SyncInfo {
     }
 }
 
-/// Compute a content hash for the given workflow template names and setup steps.
-/// The hash changes when template contents, setup steps, or the set of workflows changes.
-pub fn compute_template_hash(workflows: &[String], setup_steps: Option<&str>) -> String {
+/// Compute a content hash for the given workflow template names, setup steps,
+/// and template variables. The hash changes when any of these inputs change,
+/// including resolved package versions from the flake.
+pub fn compute_template_hash(
+    workflows: &[String],
+    setup_steps: Option<&str>,
+    template_vars: &[(String, String)],
+) -> String {
     let mut hasher = DefaultHasher::new();
 
     // Sort to make hash independent of frontmatter ordering
@@ -214,6 +219,12 @@ pub fn compute_template_hash(workflows: &[String], setup_steps: Option<&str>) ->
 
     if let Some(content) = setup_steps {
         content.hash(&mut hasher);
+    }
+
+    // Include resolved template variables (e.g., pnpm version from flake)
+    for (key, value) in template_vars {
+        key.hash(&mut hasher);
+        value.hash(&mut hasher);
     }
 
     format!("{:016x}", hasher.finish())
@@ -355,6 +366,78 @@ pub fn read_setup_steps(project_path: &Path) -> Result<Option<String>> {
     }
 }
 
+/// Resolve the version of a Nix flake package output via `nix eval`.
+pub fn resolve_nix_package_version(root: &Path, package: &str) -> Result<String> {
+    let attr = format!(".#{}.version", package);
+    let output = Command::new("nix")
+        .args(["eval", &attr, "--raw"])
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("failed to run nix eval {}", attr))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("nix eval {} failed: {}", attr, stderr.trim());
+    }
+
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if version.is_empty() {
+        bail!("nix eval {} returned empty version", attr);
+    }
+
+    Ok(version)
+}
+
+/// Resolve template variables needed for workflow injection.
+/// Calls `nix eval` to resolve package versions from the flake.
+pub fn resolve_template_vars(root: &Path, workflows: &[String]) -> Result<Vec<(String, String)>> {
+    let needs_pnpm = workflows.iter().any(|w| w == "pnpm-ci");
+    let pnpm_version = if needs_pnpm {
+        Some(resolve_nix_package_version(root, "pnpm")?)
+    } else {
+        None
+    };
+    let node_version = if needs_pnpm {
+        Some(resolve_nix_package_version(root, "nodejs")?)
+    } else {
+        None
+    };
+    Ok(build_template_vars(
+        workflows,
+        pnpm_version.as_deref(),
+        node_version.as_deref(),
+    ))
+}
+
+/// Build template variables from pre-resolved versions.
+/// Use in batch scenarios where versions are resolved once upfront.
+pub fn build_template_vars(
+    workflows: &[String],
+    pnpm_version: Option<&str>,
+    node_version: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut vars = Vec::new();
+    if workflows.iter().any(|w| w == "pnpm-ci") {
+        if let Some(ver) = pnpm_version {
+            vars.push(("pnpm_version".to_string(), ver.to_string()));
+        }
+        if let Some(ver) = node_version {
+            vars.push(("node_version".to_string(), ver.to_string()));
+        }
+    }
+    vars
+}
+
+/// Replace `{{key}}` placeholders in template content with resolved values.
+fn apply_template_vars(content: &str, vars: &[(String, String)]) -> String {
+    let mut result = content.to_string();
+    for (key, value) in vars {
+        let placeholder = ["{{", key, "}}"].concat();
+        result = result.replace(&placeholder, value);
+    }
+    result
+}
+
 /// Replace `# {{setup}}` markers in a workflow template with setup steps.
 /// If no setup content is provided, marker lines are removed.
 fn apply_setup_steps(template: &str, setup_content: Option<&str>) -> String {
@@ -415,6 +498,7 @@ pub fn sync_to_mirror(
     source_project: &Path,
     mirror_path: &Path,
     config: &MirrorConfig,
+    template_vars: &[(String, String)],
 ) -> Result<usize> {
     let excludes = build_excludes(config);
 
@@ -473,6 +557,7 @@ pub fn sync_to_mirror(
             {
                 let filename = format!("{}.yaml", workflow_name);
                 let content = apply_setup_steps(template.workflow, setup_steps.as_deref());
+                let content = apply_template_vars(&content, template_vars);
                 fs::write(workflows_dir.join(&filename), content)?;
                 file_count += 1;
 
@@ -879,6 +964,21 @@ pub struct MirrorStatus {
 pub fn get_all_status(root: &Path) -> Result<Vec<MirrorStatus>> {
     let projects = find_mirrored_projects(root)?;
 
+    // Resolve package versions once if any project uses pnpm-ci
+    let needs_pnpm = projects
+        .iter()
+        .any(|(_, c)| c.workflows.contains(&"pnpm-ci".to_string()));
+    let pnpm_version: Option<String> = if needs_pnpm {
+        Some(resolve_nix_package_version(root, "pnpm")?)
+    } else {
+        None
+    };
+    let node_version: Option<String> = if needs_pnpm {
+        Some(resolve_nix_package_version(root, "nodejs")?)
+    } else {
+        None
+    };
+
     // Batch-fetch dependabot alerts for all repos in one GraphQL query
     let repos: Vec<(String, String)> = projects
         .iter()
@@ -911,7 +1011,13 @@ pub fn get_all_status(root: &Path) -> Result<Vec<MirrorStatus>> {
         } else {
             let project_path = root.join(PROJECTS_DIR).join(&project);
             let setup_steps = read_setup_steps(&project_path).unwrap_or(None);
-            let expected_hash = compute_template_hash(&config.workflows, setup_steps.as_deref());
+            let template_vars = build_template_vars(
+                &config.workflows,
+                pnpm_version.as_deref(),
+                node_version.as_deref(),
+            );
+            let expected_hash =
+                compute_template_hash(&config.workflows, setup_steps.as_deref(), &template_vars);
             sync_info
                 .as_ref()
                 .map(|si| si.templates_hash != expected_hash)
@@ -1135,8 +1241,8 @@ mod tests {
     #[test]
     fn test_template_hash_deterministic() {
         let workflows = vec!["cargo-ci".to_string()];
-        let h1 = compute_template_hash(&workflows, None);
-        let h2 = compute_template_hash(&workflows, None);
+        let h1 = compute_template_hash(&workflows, None, &[]);
+        let h2 = compute_template_hash(&workflows, None, &[]);
         assert_eq!(h1, h2);
     }
 
@@ -1145,8 +1251,8 @@ mod tests {
         let a = vec!["cargo-ci".to_string(), "pnpm-ci".to_string()];
         let b = vec!["pnpm-ci".to_string(), "cargo-ci".to_string()];
         assert_eq!(
-            compute_template_hash(&a, None),
-            compute_template_hash(&b, None)
+            compute_template_hash(&a, None, &[]),
+            compute_template_hash(&b, None, &[])
         );
     }
 
@@ -1156,19 +1262,19 @@ mod tests {
         let pnpm = vec!["pnpm-ci".to_string()];
         let both = vec!["cargo-ci".to_string(), "pnpm-ci".to_string()];
         assert_ne!(
-            compute_template_hash(&cargo, None),
-            compute_template_hash(&pnpm, None)
+            compute_template_hash(&cargo, None, &[]),
+            compute_template_hash(&pnpm, None, &[])
         );
         assert_ne!(
-            compute_template_hash(&cargo, None),
-            compute_template_hash(&both, None)
+            compute_template_hash(&cargo, None, &[]),
+            compute_template_hash(&both, None, &[])
         );
     }
 
     #[test]
     fn test_template_hash_empty() {
         let empty: Vec<String> = vec![];
-        let h = compute_template_hash(&empty, None);
+        let h = compute_template_hash(&empty, None, &[]);
         // Empty should still produce a valid hash
         assert_eq!(h.len(), 16);
     }
@@ -1176,17 +1282,95 @@ mod tests {
     #[test]
     fn test_template_hash_differs_with_setup() {
         let workflows = vec!["cargo-ci".to_string()];
-        let without = compute_template_hash(&workflows, None);
-        let with = compute_template_hash(&workflows, Some("- run: apt-get install protoc\n"));
+        let without = compute_template_hash(&workflows, None, &[]);
+        let with = compute_template_hash(&workflows, Some("- run: apt-get install protoc\n"), &[]);
         assert_ne!(without, with);
     }
 
     #[test]
     fn test_template_hash_setup_content_matters() {
         let workflows = vec!["cargo-ci".to_string()];
-        let a = compute_template_hash(&workflows, Some("- run: install-a\n"));
-        let b = compute_template_hash(&workflows, Some("- run: install-b\n"));
+        let a = compute_template_hash(&workflows, Some("- run: install-a\n"), &[]);
+        let b = compute_template_hash(&workflows, Some("- run: install-b\n"), &[]);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_template_hash_differs_with_vars() {
+        let workflows = vec!["pnpm-ci".to_string()];
+        let without = compute_template_hash(&workflows, None, &[]);
+        let with = compute_template_hash(
+            &workflows,
+            None,
+            &[("pnpm_version".to_string(), "10.6.0".to_string())],
+        );
+        assert_ne!(without, with);
+    }
+
+    #[test]
+    fn test_template_hash_var_value_matters() {
+        let workflows = vec!["pnpm-ci".to_string()];
+        let a = compute_template_hash(
+            &workflows,
+            None,
+            &[("pnpm_version".to_string(), "10.6.0".to_string())],
+        );
+        let b = compute_template_hash(
+            &workflows,
+            None,
+            &[("pnpm_version".to_string(), "10.7.0".to_string())],
+        );
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_apply_template_vars() {
+        let content = "version: '{{pnpm_version}}'\nother: value\n";
+        let vars = vec![("pnpm_version".to_string(), "10.6.0".to_string())];
+        assert_eq!(
+            apply_template_vars(content, &vars),
+            "version: '10.6.0'\nother: value\n"
+        );
+    }
+
+    #[test]
+    fn test_apply_template_vars_no_match() {
+        let content = "no placeholders here\n";
+        let vars = vec![("pnpm_version".to_string(), "10.6.0".to_string())];
+        assert_eq!(apply_template_vars(content, &vars), content);
+    }
+
+    #[test]
+    fn test_apply_template_vars_empty() {
+        let content = "version: '{{pnpm_version}}'\n";
+        assert_eq!(apply_template_vars(content, &[]), content);
+    }
+
+    #[test]
+    fn test_build_template_vars_pnpm_ci() {
+        let workflows = vec!["pnpm-ci".to_string()];
+        let vars = build_template_vars(&workflows, Some("10.6.0"), Some("22.12.0"));
+        assert_eq!(
+            vars,
+            vec![
+                ("pnpm_version".to_string(), "10.6.0".to_string()),
+                ("node_version".to_string(), "22.12.0".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_template_vars_no_pnpm() {
+        let workflows = vec!["cargo-ci".to_string()];
+        let vars = build_template_vars(&workflows, Some("10.6.0"), Some("22.12.0"));
+        assert!(vars.is_empty());
+    }
+
+    #[test]
+    fn test_build_template_vars_no_version() {
+        let workflows = vec!["pnpm-ci".to_string()];
+        let vars = build_template_vars(&workflows, None, None);
+        assert!(vars.is_empty());
     }
 
     #[test]

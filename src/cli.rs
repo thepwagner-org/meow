@@ -96,29 +96,33 @@ pub enum Command {
         command: MirrorCommand,
     },
 
-    /// Start or manage the opencode web proxy
-    Web {
-        /// Project name or fuzzy query (omit to use interactive picker)
-        query: Option<String>,
-
-        /// Run opencode in nix-jail sandbox (--sandbox / --sandbox=false)
-        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
-        sandbox: Option<bool>,
-
+    /// Sync QMD search index collections with focused projects
+    Qmd {
         #[command(subcommand)]
-        command: Option<WebCommand>,
+        command: Option<QmdCommand>,
+    },
+
+    /// Start an agent session for one or more projects in nix-jail
+    #[command(alias = "plz")]
+    Please {
+        /// Project names (omit for interactive picker)
+        projects: Vec<String>,
+        /// Profile names to use (default: auto-detect from project files)
+        #[arg(long, short)]
+        profile: Vec<String>,
+        /// Git ref (branch, tag, or SHA) to check out
+        #[arg(long)]
+        branch: Option<String>,
+        /// Skip sandbox cleanup after the job exits (preserves root/workspace for inspection)
+        #[arg(long)]
+        no_cleanup: bool,
     },
 }
 
 #[derive(Subcommand, Debug)]
-pub enum WebCommand {
-    /// List active opencode web sessions
-    List,
-    /// Stop a project's opencode web instance
-    Stop {
-        /// Project name (omit to use interactive picker)
-        query: Option<String>,
-    },
+pub enum QmdCommand {
+    /// Show which focused projects are indexed in QMD
+    Status,
 }
 
 #[derive(Subcommand, Debug)]

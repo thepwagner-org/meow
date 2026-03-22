@@ -6,29 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, warn};
 
-use crate::cli::{JournalArgs, MirrorCommand, PruneArgs, WebCommand};
+use crate::cli::{JournalArgs, MirrorCommand, PruneArgs};
 use crate::markdown::{self, parse_frontmatter};
-use crate::{git, github, mirror, picker, sparse, web, PROJECTS_DIR};
-
-/// Call the running proxy's management API. Returns None if no proxy is running.
-async fn proxy_api_get(port: u16, path: &str) -> Option<reqwest::Response> {
-    let url = format!("http://127.0.0.1:{}/api/v1/{}", port, path);
-    reqwest::get(&url).await.ok()
-}
-
-async fn proxy_api_post(
-    port: u16,
-    path: &str,
-    body: serde_json::Value,
-) -> Option<reqwest::Response> {
-    let client = reqwest::Client::new();
-    client
-        .post(format!("http://127.0.0.1:{}/api/v1/{}", port, path))
-        .json(&body)
-        .send()
-        .await
-        .ok()
-}
+use crate::{git, github, mirror, picker, sparse, PROJECTS_DIR};
 
 pub fn validate_project_name(name: &str) -> Result<()> {
     if name.is_empty() {
@@ -242,7 +222,7 @@ pub fn cmd_init(shell: &str) -> Result<String> {
         r#"function meow
   set -l __meow_bin "{bin}"
   switch $argv[1]
-    case list ls rm drop init journal zellij z prune pull mirror web --help -h --version -V
+    case list ls rm drop init journal zellij z prune pull mirror please plz qmd --help -h --version -V
       $__meow_bin $argv
     case add cd
       set -l result ($__meow_bin $argv)
@@ -263,8 +243,8 @@ function mz
   meow zellij $argv
 end
 
-function mw
-  meow web $argv
+function mp
+  meow please $argv
 end"#
     ))
 }
@@ -646,7 +626,7 @@ pub fn cmd_zellij(
                     bail!("Timed out waiting for opencode serve to announce port");
                 }
                 if let Ok(content) = fs::read_to_string(&log_path) {
-                    if let Some(port) = content.lines().find_map(web::extract_port) {
+                    if let Some(port) = content.lines().find_map(extract_port) {
                         break port;
                     }
                 }
@@ -879,6 +859,179 @@ pub fn cmd_zellij(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// QMD integration
+// ---------------------------------------------------------------------------
+
+/// A project that should be indexed by QMD.
+struct QmdProject {
+    name: String,
+    path: PathBuf,
+    description: String,
+    mode: crate::markdown::QmdMode,
+}
+
+/// Run a qmd subcommand, returning its stdout as a String.
+fn qmd_run(args: &[&str]) -> Result<String> {
+    let out = Command::new("qmd")
+        .args(args)
+        .output()
+        .context("Failed to run qmd (is it installed?)")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!("qmd {} failed: {}", args.join(" "), stderr.trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// List collection names currently registered in QMD.
+fn qmd_collection_names() -> Result<Vec<String>> {
+    let out = Command::new("qmd")
+        .args(["collection", "list"])
+        .output()
+        .context("Failed to run qmd (is it installed?)")?;
+
+    // qmd exits 0 with "No collections" message when empty — treat non-zero as error
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Non-fatal: if qmd isn't set up yet, treat as empty
+        debug!("qmd collection list failed: {}", stderr.trim());
+        return Ok(vec![]);
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Output format: each collection starts a block with "name (qmd://name/)"
+    // Parse lines that match: word followed by whitespace and "(qmd://...)"
+    let names = stdout
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            // Lines like: "knowledge (qmd://knowledge/)" — take first word
+            let name = trimmed.split_whitespace().next()?;
+            // Only keep if followed by "(qmd://"
+            if trimmed.contains("(qmd://") && !name.starts_with('(') {
+                Some(name.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    Ok(names)
+}
+
+/// Collect focused projects that have qmd: configured.
+fn qmd_desired_projects(repo: &git2::Repository, root: &Path) -> Result<Vec<QmdProject>> {
+    let focused = sparse::get_focused_projects(root)?;
+    let mut result = Vec::new();
+    for name in focused {
+        let fm = markdown::load_readme_frontmatter(repo, root, &name);
+        let mode = fm.as_ref().and_then(|f| f.qmd_mode());
+        if let Some(mode) = mode {
+            result.push(QmdProject {
+                path: root.join(crate::PROJECTS_DIR).join(&name),
+                description: fm
+                    .as_ref()
+                    .and_then(|f| f.description.clone())
+                    .unwrap_or_default(),
+                name,
+                mode,
+            });
+        }
+    }
+    Ok(result)
+}
+
+pub fn cmd_qmd_sync(repo: &git2::Repository, root: &Path) -> Result<()> {
+    let desired = qmd_desired_projects(repo, root)?;
+    let existing = qmd_collection_names()?;
+
+    let desired_names: Vec<&str> = desired.iter().map(|p| p.name.as_str()).collect();
+
+    // Add missing collections
+    let mut needs_embed = false;
+    for project in &desired {
+        if existing.contains(&project.name) {
+            debug!("qmd: {} already indexed", project.name);
+        } else {
+            info!("qmd: adding collection '{}'", project.name);
+            let _ = qmd_run(&[
+                "collection",
+                "add",
+                &project.path.to_string_lossy(),
+                "--name",
+                &project.name,
+            ])?;
+
+            if !project.description.is_empty() {
+                let vpath = format!("qmd://{}/", project.name);
+                // Non-fatal: context add may fail if qmd isn't fully set up
+                if let Err(e) = qmd_run(&["context", "add", &vpath, &project.description]) {
+                    warn!("qmd: context add failed for {}: {}", project.name, e);
+                }
+            }
+
+            if project.mode == crate::markdown::QmdMode::Embed {
+                needs_embed = true;
+            }
+        }
+    }
+
+    // Remove collections for projects no longer focused or no longer qmd-enabled,
+    // but only touch collections whose name matches a known meow project
+    // (leave manually-added collections like 'knowledge' alone).
+    let all_projects = git::list_all_projects(repo)?;
+    for name in &existing {
+        if all_projects.contains(name) && !desired_names.contains(&name.as_str()) {
+            info!("qmd: removing collection '{}'", name);
+            let _ = qmd_run(&["collection", "remove", name])?;
+        }
+    }
+
+    // Run embed for projects that requested it
+    if needs_embed {
+        info!("qmd: running embed");
+        let status = Command::new("qmd")
+            .arg("embed")
+            .status()
+            .context("Failed to run qmd embed")?;
+        if !status.success() {
+            bail!("qmd embed failed");
+        }
+    }
+
+    Ok(())
+}
+
+pub fn cmd_qmd_status(repo: &git2::Repository, root: &Path, use_color: bool) -> Result<()> {
+    let desired = qmd_desired_projects(repo, root)?;
+    let existing = qmd_collection_names()?;
+
+    let mut md = String::new();
+    md.push_str("| Project | qmd | Indexed |\n");
+    md.push_str("|:--------|:----|:--------|\n");
+
+    for project in &desired {
+        let indexed = if existing.contains(&project.name) {
+            "yes"
+        } else {
+            "no"
+        };
+        let mode = match project.mode {
+            crate::markdown::QmdMode::Index => "true",
+            crate::markdown::QmdMode::Embed => "embed",
+        };
+        md.push_str(&format!("| {} | {} | {} |\n", project.name, mode, indexed));
+    }
+
+    if desired.is_empty() {
+        info!("No focused projects have qmd: configured");
+    } else {
+        markdown::skin(use_color).print_text(&md);
+    }
+
+    Ok(())
+}
+
 /// Exit code indicating mirror is already synced (no work needed).
 pub const EXIT_ALREADY_SYNCED: u8 = 2;
 
@@ -1005,8 +1158,9 @@ fn cmd_mirror_diff(root: &Path, project: Option<String>, no_scan: bool) -> Resul
     let source_path = root.join(PROJECTS_DIR).join(&project);
     let latest_commit = mirror::get_latest_project_commit(root, &project)?;
     let setup_steps = mirror::read_setup_steps(&source_path)?;
+    let template_vars = mirror::resolve_template_vars(root, &config.workflows)?;
     let expected_template_hash =
-        mirror::compute_template_hash(&config.workflows, setup_steps.as_deref());
+        mirror::compute_template_hash(&config.workflows, setup_steps.as_deref(), &template_vars);
     if let Some(sync_info) = mirror::get_sync_info(&mirror_path) {
         if sync_info.commit == latest_commit && sync_info.templates_hash == expected_template_hash {
             #[allow(clippy::print_stdout)]
@@ -1022,7 +1176,7 @@ fn cmd_mirror_diff(root: &Path, project: Option<String>, no_scan: bool) -> Resul
     }
 
     // Sync filtered content to mirror
-    let file_count = mirror::sync_to_mirror(&source_path, &mirror_path, &config)?;
+    let file_count = mirror::sync_to_mirror(&source_path, &mirror_path, &config, &template_vars)?;
 
     // Write sync info for shipit-mirror to use when creating the tag
     let sync_info = mirror::SyncInfo {
@@ -1129,244 +1283,184 @@ fn cmd_mirror_push(root: &Path, project: Option<String>, message: &str) -> Resul
     Ok(())
 }
 
-pub fn cmd_web(
-    _repo: &git2::Repository,
+/// Submit projects to nix-jail via nj-web and open the browser.
+pub fn cmd_agent(
+    repo: &git2::Repository,
     root: &Path,
-    query: Option<String>,
-    command: Option<WebCommand>,
-    sandbox: Option<bool>,
+    projects: Vec<String>,
+    profiles: Vec<String>,
+    branch: Option<String>,
+    no_cleanup: bool,
     use_color: bool,
-) -> Result<Option<u8>> {
+) -> Result<()> {
+    let config = crate::config::Config::load()?;
+
+    // Resolve project names. With no args, use interactive picker over all projects.
+    let all_projects = git::list_all_projects(repo)?;
+
+    let resolved: Vec<String> = if projects.is_empty() {
+        vec![resolve_project(None, all_projects, use_color)?]
+    } else {
+        projects
+            .into_iter()
+            .map(|q| resolve_project(Some(q), all_projects.clone(), use_color))
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    if resolved.is_empty() {
+        bail!("No project selected");
+    }
+
+    let primary = &resolved[0];
+    let primary_path = format!("{PROJECTS_DIR}/{primary}");
+    let extra_paths: Vec<String> = resolved[1..]
+        .iter()
+        .map(|p| format!("{PROJECTS_DIR}/{p}"))
+        .collect();
+
+    // Auto-detect profiles when not overridden.
+    let profiles = if profiles.is_empty() {
+        let project_dir = root.join(PROJECTS_DIR).join(primary);
+        let mut detected = vec!["opencode".to_string()];
+        if project_dir.join("Cargo.toml").exists() {
+            detected.push("cargo".to_string());
+        }
+        detected
+    } else {
+        profiles
+    };
+
+    // Get git remote origin URL for the repo, normalised to HTTPS (nj-web
+    // requires an HTTPS URL for cloning; SSH remotes are converted).
+    let remote = repo
+        .find_remote("origin")
+        .context("No remote 'origin' found")?;
+    let repo_url = ssh_to_https(remote.url().context("Remote 'origin' has no URL")?);
+
+    // Use the primary project name as the base subdomain (DNS-safe label).
+    let subdomain = primary.replace('_', "-").to_ascii_lowercase();
+
+    let body = serde_json::json!({
+        "profiles": profiles,
+        "repo": repo_url,
+        "path": primary_path,
+        "extra_paths": extra_paths,
+        "cwd": primary_path,
+        "push": true,
+        "git_ref": branch,
+        "subdomain": subdomain,
+        "no_cleanup": no_cleanup,
+    });
+
+    info!(
+        primary = %primary,
+        profiles = ?body["profiles"],
+        "submitting agent job to nj-web"
+    );
+
     let runtime = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+    let response: serde_json::Value = runtime.block_on(async {
+        let client = reqwest::Client::new();
+        let url = format!("{}/api/jobs", config.nj_web_url);
+        let resp = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to POST to nj-web")?;
+        let status = resp.status();
+        info!(status = status.as_u16(), "nj-web response");
+        resp.error_for_status()
+            .context("nj-web returned error status")?
+            .json()
+            .await
+            .context("Failed to parse nj-web response")
+    })?;
 
-    match command {
-        Some(WebCommand::List) => {
-            runtime.block_on(async {
-                match web::running_proxy_port().await {
-                    None => info!("No meow web proxy running"),
-                    Some(port) => {
-                        let sessions: Vec<web::SessionInfo> = proxy_api_get(port, "sessions")
-                            .await
-                            .context("Failed to reach proxy")?
-                            .json()
-                            .await
-                            .context("Failed to parse sessions")?;
-                        if sessions.is_empty() {
-                            info!("No active sessions");
-                        } else {
-                            #[allow(clippy::print_stdout)]
-                            for s in &sessions {
-                                println!("{} (port {})", s.project, s.port);
-                            }
-                        }
-                    }
-                }
-                Ok::<(), anyhow::Error>(())
-            })?;
-            Ok(None)
+    if let Some(err) = response["error"].as_str() {
+        bail!("nj-web rejected job: {err}");
+    }
+
+    let job_id = response["job_id"]
+        .as_str()
+        .context("No job_id in nj-web response")?;
+
+    info!(job_id, "job submitted");
+
+    Ok(())
+}
+
+/// Convert an SSH remote URL to HTTPS so nj-web can clone it.
+///
+/// Handles:
+/// - `ssh://user@host:port/path` → `https://host/path`
+/// - `git@host:path`             → `https://host/path`
+/// - `https://…`                 → unchanged
+fn ssh_to_https(url: &str) -> String {
+    // ssh://[user@]host[:port]/path
+    if let Some(rest) = url.strip_prefix("ssh://") {
+        let after_user = rest.find('@').map(|i| &rest[i + 1..]).unwrap_or(rest);
+        // strip optional :port
+        let path_start = after_user.find('/').unwrap_or(after_user.len());
+        let host = &after_user[..path_start];
+        let host = host.find(':').map(|i| &host[..i]).unwrap_or(host);
+        let path = &after_user[path_start..];
+        return format!("https://{host}{path}");
+    }
+    // git@host:path
+    if let Some(rest) = url.strip_prefix("git@") {
+        if let Some(colon) = rest.find(':') {
+            let host = &rest[..colon];
+            let path = &rest[colon + 1..];
+            return format!("https://{host}/{path}");
         }
+    }
+    url.to_owned()
+}
 
-        Some(WebCommand::Stop { query: stop_query }) => {
-            let focused = sparse::get_focused_projects(root)?;
-            if focused.is_empty() {
-                bail!("No projects currently focused");
-            }
-            let project = resolve_project(stop_query, focused, use_color)?;
-            runtime.block_on(async {
-                let port = web::running_proxy_port()
-                    .await
-                    .context("No meow web proxy running")?;
-                let resp = proxy_api_post(port, "stop", serde_json::json!({"project": project}))
-                    .await
-                    .context("Failed to reach proxy")?;
-                if resp.status().is_success() {
-                    info!("Stopped '{}'", project);
-                } else {
-                    let body: serde_json::Value = resp.json().await.unwrap_or_default();
-                    bail!("{}", body["error"].as_str().unwrap_or("unknown error"));
-                }
-                Ok(())
-            })?;
-            Ok(None)
-        }
+#[cfg(test)]
+mod ssh_to_https_tests {
+    use super::ssh_to_https;
 
-        None => {
-            let mut web_config = crate::config::Config::load()?.web;
+    #[test]
+    fn test_ssh_with_user_and_port() {
+        assert_eq!(
+            ssh_to_https("ssh://git@git.example.com:2222/org/repo.git"),
+            "https://git.example.com/org/repo.git"
+        );
+    }
 
-            // Apply --sandbox CLI override.
-            if let Some(want_sandbox) = sandbox {
-                if want_sandbox {
-                    match web_config.sandbox {
-                        Some(ref mut s) => s.enabled = true,
-                        None => bail!(
-                            "--sandbox requires sandbox config in config.yaml \
-                             (web.sandbox.nj_bin, alice_bin, sandbox_package)"
-                        ),
-                    }
-                } else {
-                    web_config.sandbox = None;
-                }
-            }
+    #[test]
+    fn test_ssh_plain() {
+        assert_eq!(
+            ssh_to_https("ssh://git.example.com/org/repo.git"),
+            "https://git.example.com/org/repo.git"
+        );
+    }
 
-            // No query and no subcommand → open the home landing page
-            if query.is_none() {
-                let url = home_url(&web_config);
-                let existing_proxy = runtime.block_on(web::running_proxy_port());
-                if let Some(_port) = existing_proxy {
-                    open_chrome(&url);
-                } else {
-                    // No proxy running - we are the server.
-                    // Start with a dummy project that will never be used before the
-                    // browser opens; the landing page handles everything from there.
-                    info!("Starting meow web proxy");
-                    let dummy_project = String::new();
-                    let dummy_path = root.to_path_buf();
-                    runtime.block_on(async {
-                        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
-                        let server_task = tokio::spawn(web::run_server(
-                            web_config,
-                            dummy_project,
-                            dummy_path,
-                            root.to_path_buf(),
-                            Some(ready_tx),
-                        ));
-                        let _ = ready_rx.await;
-                        open_chrome(&url);
-                        server_task.await.context("server task panicked")??;
-                        Ok::<(), anyhow::Error>(())
-                    })?;
-                }
-                return Ok(None);
-            }
+    #[test]
+    fn test_git_at_scp() {
+        assert_eq!(
+            ssh_to_https("git@github.com:org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
+    }
 
-            let focused = sparse::get_focused_projects(root)?;
-            if focused.is_empty() {
-                bail!("No projects currently focused");
-            }
-            let project = resolve_project(query, focused, use_color)?;
-            let project_path = root.join(crate::PROJECTS_DIR).join(&project);
-            let project_url = project_url(&web_config, &project);
-
-            let existing_proxy = runtime.block_on(web::running_proxy_port());
-
-            if let Some(port) = existing_proxy {
-                // Proxy already running - add project and open browser, then exit
-                runtime.block_on(async {
-                    let resp = proxy_api_post(
-                        port,
-                        "add",
-                        serde_json::json!({
-                            "project": project,
-                            "path": project_path.display().to_string(),
-                        }),
-                    )
-                    .await
-                    .context("Failed to reach proxy")?;
-                    if resp.status().is_success() {
-                        info!("Added '{}' to running proxy", project);
-                    } else {
-                        let body: serde_json::Value = resp.json().await.unwrap_or_default();
-                        bail!("{}", body["error"].as_str().unwrap_or("unknown error"));
-                    }
-                    Ok::<(), anyhow::Error>(())
-                })?;
-                open_chrome(&project_url);
-            } else {
-                // No proxy running - we are the server.
-                // Start the server, wait until it's ready, then open the browser.
-                info!("Starting meow web proxy for '{}'", project);
-                runtime.block_on(async {
-                    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
-                    let server_task = tokio::spawn(web::run_server(
-                        web_config,
-                        project.clone(),
-                        project_path.clone(),
-                        root.to_path_buf(),
-                        Some(ready_tx),
-                    ));
-                    // Wait for the server to signal it's listening before opening browser
-                    let _ = ready_rx.await;
-                    open_chrome(&project_url);
-                    // Now block until the server exits
-                    server_task.await.context("server task panicked")??;
-                    Ok::<(), anyhow::Error>(())
-                })?;
-            }
-            Ok(None)
-        }
+    #[test]
+    fn test_https_passthrough() {
+        assert_eq!(
+            ssh_to_https("https://git.example.com/org/repo.git"),
+            "https://git.example.com/org/repo.git"
+        );
     }
 }
 
-/// Pick the "primary" host for URL construction: prefer TLS hosts, otherwise
-/// use the first configured host.
-fn primary_host(web_config: &crate::config::WebConfig) -> &crate::config::HostConfig {
-    web_config
-        .tls_hosts()
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| &web_config.hosts[0])
-}
-
-/// Build the URL for the landing page on the meow web proxy.
-fn home_url(web_config: &crate::config::WebConfig) -> String {
-    let hc = primary_host(web_config);
-    let tls = hc.tls_enabled();
-    let scheme = if tls { "https" } else { "http" };
-    let port = if tls {
-        web_config.port
-    } else {
-        web_config.http_port
-    };
-    let port_suffix = match (tls, port) {
-        (true, 443) | (false, 80) => String::new(),
-        (_, p) => format!(":{}", p),
-    };
-    format!("{}://home.{}{}/", scheme, hc.hostname, port_suffix)
-}
-
-fn project_url(web_config: &crate::config::WebConfig, project: &str) -> String {
-    let hc = primary_host(web_config);
-    let tls = hc.tls_enabled();
-    let scheme = if tls { "https" } else { "http" };
-    let port = if tls {
-        web_config.port
-    } else {
-        web_config.http_port
-    };
-    let port_suffix = match (tls, port) {
-        (true, 443) | (false, 80) => String::new(),
-        (_, p) => format!(":{}", p),
-    };
-    format!("{}://{}.{}{}/", scheme, project, hc.hostname, port_suffix)
-}
-
-/// Open a URL in Chrome Beta if available, falling back to xdg-open.
-/// When running inside opencode (OPENCODE=1), prints a message for the
-/// model instead of attempting to launch a browser.
-fn open_chrome(url: &str) {
-    if std::env::var("OPENCODE").is_ok() {
-        #[allow(clippy::print_stdout)]
-        {
-            println!("Session open at {}", url);
-        }
-        return;
-    }
-
-    // Try macOS `open -a "Google Chrome Beta"` first
-    if cfg!(target_os = "macos") {
-        let status = Command::new("open")
-            .args(["-a", "Google Chrome Beta", url])
-            .status();
-        match status {
-            Ok(s) if s.success() => return,
-            _ => {} // fall through to xdg-open
-        }
-    }
-
-    // Try xdg-open (Linux / fallback)
-    if let Err(e) = Command::new("xdg-open").arg(url).status() {
-        warn!("Failed to open browser: {}", e);
-    }
+/// Extract a port number from a log line (e.g. "listening on :3000").
+/// Matches a 4-5 digit port preceded by `:` and followed by `/`, whitespace, or end.
+fn extract_port(line: &str) -> Option<u16> {
+    let re = regex::Regex::new(r":(\d{4,5})(?:[/\s]|$)").ok()?;
+    let caps = re.captures(line)?;
+    caps.get(1)?.as_str().parse().ok()
 }
 
 /// Resolve a project from an optional fuzzy query + list of candidates.

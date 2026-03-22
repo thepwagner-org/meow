@@ -41,6 +41,14 @@ Currently `meow journal` is read-only. Could add entry creation.
 - Language templates layer on top
 - Keep defaults minimal - don't over-engineer
 
+## QMD Integration
+
+`meow qmd` syncs QMD collections with focused projects. Future possibilities:
+
+- **Auto-sync on `meow add`/`meow rm`** — call `meow qmd` automatically after sparse-checkout changes
+- **Typedown context enrichment** — use `td json` output to populate `qmd context add` with richer metadata from schema-validated docs
+- **`qmd: embed` auto-trigger** — run `qmd embed` selectively for collections that have changed since last embed, not all at once
+
 ## Non-Goals
 
 Explicitly out of scope to keep the project focused:
